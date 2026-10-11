@@ -1,0 +1,41 @@
+{
+  "name": "context-bar",
+  "version": "0.1.0",
+  "description": "A stacked context-window bar above the prompt, colored like /context, with cost estimates, compaction and cost warnings, and per-subagent cache tracking. Toggle with /context-bar.",
+  "author": { "name": "StormKiln" },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "sessionCostWarnUsd": {
+      "type": "number",
+      "title": "Session cost warning (USD)",
+      "description": "Warn when the session's total cost passes this amount, and again at each doubling.",
+      "default": 10
+    },
+    "requestCostWarnUsd": {
+      "type": "number",
+      "title": "Per-request cost warning (USD)",
+      "description": "Warn when re-sending the current context on a cold cache would cost more than this per request.",
+      "default": 0.5
+    },
+    "compactWarnPercent": {
+      "type": "number",
+      "title": "Compaction warning (%)",
+      "description": "Warn when context reaches this share of the auto-compact threshold.",
+      "default": 80
+    },
+    "cacheTtl": {
+      "type": "string",
+      "title": "Prompt cache TTL",
+      "description": "The cache lifetime used to price cache writes and to tell idle expiry apart from other cache resets.",
+      "options": ["5m", "1h"],
+      "default": "5m"
+    },
+    "maxSubagentRows": {
+      "type": "number",
+      "title": "Subagent rows",
+      "description": "How many subagent lines the bar shows at most.",
+      "default": 4
+    }
+  }
+}

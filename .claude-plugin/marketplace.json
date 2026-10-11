@@ -1,0 +1,17 @@
+{
+  "name": "stormkiln-cc-plugins",
+  "owner": { "name": "StormKiln", "url": "https://github.com/StormKiln" },
+  "metadata": {
+    "description": "Claude Code plugins from StormKiln."
+  },
+  "plugins": [
+    {
+      "name": "context-bar",
+      "source": "./plugins/context-bar",
+      "description": "A stacked context-window bar above the prompt, colored like /context, with cost estimates, compaction and cost warnings, and per-subagent cache-rewrite tracking.",
+      "version": "0.1.0",
+      "category": "productivity",
+      "keywords": ["context", "cost", "cache", "subagents", "tokens"]
+    }
+  ]
+}

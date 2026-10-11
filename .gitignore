@@ -1,0 +1,5 @@
+# Laid down by Claude Code when it loads a plugin under development
+plugins/*/.claude-plugin/types/
+plugins/*/tsconfig.json
+node_modules/
+.DS_Store
