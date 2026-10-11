@@ -105,6 +105,15 @@ export function usageUsd(model: string, usage: Usage, ttl: CacheTtl): number {
   )
 }
 
+/**
+ * A request's cache writes at the plain input rate, before the TTL's multiplier:
+ * kept per loop so its cost can be re-priced once the loop's real TTL is known.
+ */
+export function writeBaseUsd(model: string, usage: Usage): number {
+  const prompt = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+  return (usage.cache_creation_input_tokens * tierFor(priceFor(model), prompt).input) / 1_000_000
+}
+
 /** USD to send `tokens` of context once: read from a warm cache, or written to a cold one. */
 export function contextUsd(model: string, tokens: number, ttl: CacheTtl): { warm: number; cold: number } {
   const rate = tierFor(priceFor(model), tokens)

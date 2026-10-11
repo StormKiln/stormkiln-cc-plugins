@@ -1,11 +1,25 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
-import type { On, SessionUsage, TurnStepInput, TurnStepResult } from 'claude-code'
+import type { On, SessionRateLimit, SessionUsage, TurnStepInput, TurnStepResult } from 'claude-code'
 
-import { advise, applyStep, layoutBar, newLoop, readOptions } from '../hooks/logic'
+import {
+  MAIN,
+  advise,
+  applyStep,
+  billingFrom,
+  layoutBar,
+  newLoop,
+  readOptions,
+  resolveTtl,
+  retime,
+  ttlFromCacheCreation,
+  type TtlContext,
+} from '../hooks/logic'
 import { contextUsd, normalizeModel, priceFor } from '../hooks/pricing'
 
 const OPTIONS = readOptions({})
 const MODEL = 'claude-opus-5-5'
+const API: TtlContext = { setting: 'auto', billing: 'api' }
+const SUBSCRIPTION: TtlContext = { setting: 'auto', billing: 'subscription' }
 
 const usage = (read: number, write: number, input = 200, output = 500) => ({
   input_tokens: input,
@@ -33,13 +47,13 @@ describe('pricing', () => {
 
 describe('cache rewrites', () => {
   test('the first request writes the cache without counting as a rewrite', async () => {
-    const { reset } = applyStep(newLoop('a', 'a', 'Explore', '', 0), { model: MODEL, usage: usage(0, 40_000), startedAt: 0, afterCompaction: false }, '5m')
+    const { reset } = applyStep(newLoop('a', 'a', 'Explore', '', 0), { model: MODEL, usage: usage(0, 40_000), startedAt: 0, afterCompaction: false }, API)
     expect(reset).toBeNull()
   })
 
   test('a warm follow-up reads the cache', async () => {
-    let loop = applyStep(newLoop('a', 'a', 'Explore', '', 0), { model: MODEL, usage: usage(0, 40_000), startedAt: 0, afterCompaction: false }, '5m').loop
-    const step = applyStep(loop, { model: MODEL, usage: usage(40_000, 2_000), startedAt: 60_000, afterCompaction: false }, '5m')
+    let loop = applyStep(newLoop('a', 'a', 'Explore', '', 0), { model: MODEL, usage: usage(0, 40_000), startedAt: 0, afterCompaction: false }, API).loop
+    const step = applyStep(loop, { model: MODEL, usage: usage(40_000, 2_000), startedAt: 60_000, afterCompaction: false }, API)
     loop = step.loop
     expect(step.reset).toBeNull()
     expect(loop.steps).toBe(2)
@@ -47,8 +61,8 @@ describe('cache rewrites', () => {
   })
 
   test('a rewrite after the TTL is blamed on idling', async () => {
-    const first = applyStep(newLoop('a', 'a', 'Explore', '', 0), { model: MODEL, usage: usage(0, 40_000), startedAt: 0, afterCompaction: false }, '5m').loop
-    const { loop, reset } = applyStep(first, { model: MODEL, usage: usage(0, 41_000), startedAt: 6 * 60_000, afterCompaction: false }, '5m')
+    const first = applyStep(newLoop('a', 'a', 'Explore', '', 0), { model: MODEL, usage: usage(0, 40_000), startedAt: 0, afterCompaction: false }, API).loop
+    const { loop, reset } = applyStep(first, { model: MODEL, usage: usage(0, 41_000), startedAt: 6 * 60_000, afterCompaction: false }, API)
     expect(reset?.cause).toBe('idle')
     expect(reset?.idleMs).toBe(6 * 60_000)
     expect(loop.resetCount).toBe(1)
@@ -56,10 +70,62 @@ describe('cache rewrites', () => {
   })
 
   test('a quick rewrite on a new model is blamed on the switch, otherwise on the prefix', async () => {
-    const first = applyStep(newLoop('a', 'a', 'x', '', 0), { model: MODEL, usage: usage(0, 40_000), startedAt: 0, afterCompaction: false }, '5m').loop
-    expect(applyStep(first, { model: 'claude-sonnet-5-5', usage: usage(0, 41_000), startedAt: 1000, afterCompaction: false }, '5m').reset?.cause).toBe('model')
-    expect(applyStep(first, { model: MODEL, usage: usage(0, 41_000), startedAt: 1000, afterCompaction: false }, '5m').reset?.cause).toBe('prefix')
-    expect(applyStep(first, { model: MODEL, usage: usage(0, 41_000), startedAt: 1000, afterCompaction: true }, '5m').reset?.cause).toBe('compaction')
+    const first = applyStep(newLoop('a', 'a', 'x', '', 0), { model: MODEL, usage: usage(0, 40_000), startedAt: 0, afterCompaction: false }, API).loop
+    expect(applyStep(first, { model: 'claude-sonnet-5-5', usage: usage(0, 41_000), startedAt: 1000, afterCompaction: false }, API).reset?.cause).toBe('model')
+    expect(applyStep(first, { model: MODEL, usage: usage(0, 41_000), startedAt: 1000, afterCompaction: false }, API).reset?.cause).toBe('prefix')
+    expect(applyStep(first, { model: MODEL, usage: usage(0, 41_000), startedAt: 1000, afterCompaction: true }, API).reset?.cause).toBe('compaction')
+  })
+})
+
+describe('cache TTL', () => {
+  test('defaults to auto, and a setting forces one TTL for every loop', async () => {
+    expect(OPTIONS.cacheTtl).toBe('auto')
+    expect(resolveTtl('agent-1', { ttl: '5m', source: 'observed' }, { setting: '1h', billing: 'api' })).toEqual({ ttl: '1h', source: 'setting' })
+  })
+
+  test('follows the billing type until there is direct evidence', async () => {
+    expect(resolveTtl(MAIN, null, SUBSCRIPTION)).toEqual({ ttl: '1h', source: 'plan' })
+    expect(resolveTtl('agent-1', null, SUBSCRIPTION)).toEqual({ ttl: '5m', source: 'plan' })
+    expect(resolveTtl(MAIN, null, API)).toEqual({ ttl: '5m', source: 'plan' })
+    expect(resolveTtl(MAIN, null, { setting: 'auto', billing: 'unknown' })).toEqual({ ttl: '5m', source: 'default' })
+    expect(resolveTtl(MAIN, { ttl: '5m', source: 'engine' }, SUBSCRIPTION)).toEqual({ ttl: '5m', source: 'engine' })
+  })
+
+  test('tells the billing type from the rate-limit windows', async () => {
+    expect(billingFrom(['five_hour', 'seven_day'], true)).toBe('subscription')
+    expect(billingFrom([], false)).toBe('unknown')
+    expect(billingFrom([], true)).toBe('api')
+    expect(billingFrom(['spend_limit'], true)).toBe('api')
+  })
+
+  test('re-prices cache writes when the TTL changes', async () => {
+    const loop = applyStep(newLoop(MAIN, 'main', 'main', '', 0), { model: MODEL, usage: usage(0, 1_000_000, 0, 0), startedAt: 0, afterCompaction: false }, API).loop
+    expect(Math.abs(loop.usd - 5) < 1e-9).toBe(true)
+    const hour = retime(loop, SUBSCRIPTION)
+    expect(hour.ttl).toBe('1h')
+    expect(Math.abs(hour.usd - 8) < 1e-9).toBe(true)
+  })
+
+  test('a cache read after more than 5 minutes idle proves a 1-hour TTL', async () => {
+    const first = applyStep(newLoop('a', 'a', 'x', '', 0), { model: MODEL, usage: usage(0, 40_000), startedAt: 0, afterCompaction: false }, API).loop
+    expect(first.ttl).toBe('5m')
+    const { loop, reset } = applyStep(first, { model: MODEL, usage: usage(40_000, 1_000), startedAt: 20 * 60_000, afterCompaction: false }, API)
+    expect(reset).toBeNull()
+    expect(loop.ttl).toBe('1h')
+    expect(loop.ttlSource).toBe('observed')
+  })
+
+  test('on a 1-hour TTL, a quick rewrite is not blamed on idling', async () => {
+    const first = applyStep(newLoop(MAIN, 'main', 'main', '', 0), { model: MODEL, usage: usage(0, 40_000), startedAt: 0, afterCompaction: false }, SUBSCRIPTION).loop
+    const { reset } = applyStep(first, { model: MODEL, usage: usage(0, 41_000), startedAt: 7 * 60_000, afterCompaction: false }, SUBSCRIPTION)
+    expect(reset?.cause).toBe('prefix')
+  })
+
+  test("reads a subagent's TTL from its cache-write split", async () => {
+    expect(ttlFromCacheCreation({ ephemeral_1h_input_tokens: 30_000, ephemeral_5m_input_tokens: 0 })).toBe('1h')
+    expect(ttlFromCacheCreation({ ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 30_000 })).toBe('5m')
+    expect(ttlFromCacheCreation({ ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 0 })).toBeNull()
+    expect(ttlFromCacheCreation(null)).toBeNull()
   })
 })
 
@@ -94,7 +160,7 @@ describe('advice', () => {
       sessionUsd: 3,
       at: 0,
     }
-    const [first] = advise(snap, [], 0, OPTIONS)
+    const [first] = advise(snap, [], 0, OPTIONS, 'api')
     expect(first?.level).toBe('alert')
     expect(first?.text).toContain('/compact')
   })
@@ -135,9 +201,9 @@ const BREAKDOWN: SessionUsage = {
   cost: { usd: 1.25 },
 }
 
-function bottom(on: On) {
+function bottom(on: On, rateLimits: SessionRateLimit[] = []) {
   on('session.start', async ($, e) => ({ cwd: e.cwd }))
-  on('session.usage', async () => ({ value: BREAKDOWN }))
+  on('session.usage', async () => ({ value: { ...BREAKDOWN, rateLimits } }))
   on('command.register', async () => ({ value: undefined }) as never)
   on('turn.complete', async ($, e) => ({ text: e.answer }))
   // The engine draws nothing above the prompt of its own.
@@ -189,6 +255,56 @@ test('draws the bar, costs and a subagent cache rewrite', async ($, on) => {
   }
 })
 
+test('on a subscription the main cache lasts an hour and the dollars are labelled', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  mock.store(on)
+  const queue = bottom(on, [{ kind: 'five_hour', percentUsed: 12 }])
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  queue('main', usage(0, 60_000))
+  await drain($.turn.step({ turnId: 't', index: 0, model: MODEL, messageCount: 2 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
+
+  const ui = await $.ui.mount({ plugin: 'context-bar', surface: 'terminal', ...BAND })
+  expect(await ui.find({ text: /subscription: API-price equivalent/ })).toBeDefined()
+  expect(await ui.find({ text: /cache warm 1h00 of 1h \(usual for this billing\)/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test("Claude Code's own TTL report and a subagent's usage set the TTL", async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  mock.store(on)
+  const queue = bottom(on)
+  on('classic.PostModelSwitch', async () => ({}))
+  on('tool.call', async () => ({
+    result: { agentId: 'agent-1', usage: { cache_creation: { ephemeral_1h_input_tokens: 30_000, ephemeral_5m_input_tokens: 0 } } } as never,
+  }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  queue('main', usage(0, 60_000))
+  queue('agent-1', usage(0, 30_000))
+  await drain($.turn.step({ turnId: 't', index: 0, model: MODEL, messageCount: 2 }))
+  await drain($.turn.step({ turnId: 'a', index: 0, model: MODEL, messageCount: 2, agentId: 'agent-1' }))
+
+  await $.classic.PostModelSwitch({
+    from_model: 'claude-sonnet-5-5',
+    to_model: MODEL,
+    requested_model: 'opus',
+    source: 'command',
+    context_tokens: 60_000,
+    prompt_cache_warm: false,
+    cache_ttl: '1h',
+    estimated_cache_write_usd: 0.48,
+    pricing: 'catalog',
+  })
+  await $.tool.call({ tool: 'Agent', description: 'find', prompt: 'find' } as never)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
+
+  const ui = await $.ui.mount({ plugin: 'context-bar', surface: 'terminal', ...BAND })
+  expect(await ui.find({ text: /of 1h/ })).toBeDefined()
+  expect(await ui.find({ text: /reported by Claude Code/ })).toBeDefined()
+  expect(await ui.find({ text: /1h cache/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('/context-bar hides and shows the band', async ($, on) => {
   mock.clock(on, { now: 0 })
   mock.store(on)
@@ -206,4 +322,40 @@ test('/context-bar hides and shows the band', async ($, on) => {
   const shown = await $.ui.mount({ plugin: 'context-bar', surface: 'terminal', ...BAND })
   expect(await shown.find({ text: /200k/ })).toBeDefined()
   await shown.unmount()
+})
+
+test('follows /context-bar on|off from other sessions, unless --here', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  // The store every session of this plugin shares; another session writes it.
+  const shared: Record<string, unknown> = {}
+  on('store.get', async ($, e) => ({ value: shared[e.key] }) as never)
+  on('store.set', async ($, e) => {
+    shared[e.key] = e.value
+    return { value: undefined } as never
+  })
+  bottom(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'x', reason: 'answer' })
+  const isDrawn = async () => {
+    const ui = await $.ui.mount({ plugin: 'context-bar', surface: 'terminal', ...BAND })
+    const found = (await ui.find({ text: /200k/ })) !== undefined
+    await ui.unmount()
+    return found
+  }
+  expect(await isDrawn()).toBe(true)
+
+  shared.isVisible = false
+  await clock.advance(15_000)
+  expect(await isDrawn()).toBe(false)
+
+  const here = await $.command.run({ command: 'context-bar', args: 'on --here', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 150 } } as never)
+  expect(here.text).toContain('this session only')
+  expect(shared.isVisible).toBe(false)
+  await clock.advance(15_000)
+  expect(await isDrawn()).toBe(true)
+
+  await $.command.run({ command: 'context-bar', args: 'off', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 150 } } as never)
+  shared.isVisible = true
+  await clock.advance(15_000)
+  expect(await isDrawn()).toBe(true)
 })

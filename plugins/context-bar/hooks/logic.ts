@@ -1,7 +1,7 @@
 // The bar's arithmetic, kept free of `$` so tests can drive it directly.
 
-import type { BarCategory, CacheReset, CacheResetCause, ContextSnapshot, LoopStat } from '../types'
-import { contextUsd, type CacheTtl, type Usage, usageUsd } from './pricing'
+import type { BarCategory, Billing, CacheReset, CacheResetCause, ContextSnapshot, LoopStat, TtlSource } from '../types'
+import { contextUsd, type CacheTtl, type Usage, usageUsd, writeBaseUsd, writeMultiplier } from './pricing'
 
 export const MAIN = 'main'
 
@@ -16,7 +16,8 @@ export type Options = {
   sessionCostWarnUsd: number
   requestCostWarnUsd: number
   compactWarnPercent: number
-  cacheTtl: CacheTtl
+  /** `auto` works the TTL out per loop (resolveTtl); `5m` or `1h` forces it. */
+  cacheTtl: CacheTtl | 'auto'
   maxSubagentRows: number
 }
 
@@ -29,13 +30,88 @@ export function readOptions(raw: Readonly<Record<string, unknown>>): Options {
     sessionCostWarnUsd: num('sessionCostWarnUsd', 10),
     requestCostWarnUsd: num('requestCostWarnUsd', 0.5),
     compactWarnPercent: Math.min(99, num('compactWarnPercent', 80)),
-    cacheTtl: raw.cacheTtl === '1h' ? '1h' : '5m',
+    cacheTtl: raw.cacheTtl === '1h' || raw.cacheTtl === '5m' ? raw.cacheTtl : 'auto',
     maxSubagentRows: Math.round(num('maxSubagentRows', 4)),
   }
 }
 
 export function ttlMs(ttl: CacheTtl): number {
   return ttl === '1h' ? 3_600_000 : 300_000
+}
+
+/** What a loop's TTL is decided from, besides the loop's own evidence. */
+export type TtlContext = { setting: Options['cacheTtl']; billing: Billing }
+
+/**
+ * A loop's cache TTL, strongest source first: the setting, then direct evidence
+ * (Claude Code's report, the subagent's final usage, a read seen after idling),
+ * then the billing type: a subscription caches the main conversation for an
+ * hour and subagents for 5 minutes; per-token billing caches for 5 minutes.
+ */
+export function resolveTtl(
+  id: string,
+  evidence: LoopStat['ttlEvidence'],
+  ctx: TtlContext,
+): { ttl: CacheTtl; source: TtlSource } {
+  if (ctx.setting !== 'auto') return { ttl: ctx.setting, source: 'setting' }
+  if (evidence) return { ttl: evidence.ttl, source: evidence.source }
+  if (ctx.billing === 'subscription') return { ttl: id === MAIN ? '1h' : '5m', source: 'plan' }
+  return { ttl: '5m', source: ctx.billing === 'api' ? 'plan' : 'default' }
+}
+
+/** Brings a loop's TTL up to date, re-pricing its cache writes at the new one. */
+export function retime(loop: LoopStat, ctx: TtlContext): LoopStat {
+  const { ttl, source } = resolveTtl(loop.id, loop.ttlEvidence, ctx)
+  if (ttl === loop.ttl && source === loop.ttlSource) return loop
+  const repriced = loop.writeBaseUsd * (writeMultiplier(ttl) - writeMultiplier(loop.ttl))
+  return { ...loop, ttl, ttlSource: source, usd: loop.usd + repriced }
+}
+
+/** Records direct evidence of a loop's TTL and re-prices it. */
+export function withEvidence(loop: LoopStat, evidence: NonNullable<LoopStat['ttlEvidence']>, ctx: TtlContext): LoopStat {
+  return retime({ ...loop, ttlEvidence: evidence }, ctx)
+}
+
+/** The TTL a finished subagent's writes used, from the Agent result's split; null when it wrote nothing. */
+export function ttlFromCacheCreation(split: { ephemeral_1h_input_tokens: number; ephemeral_5m_input_tokens: number } | null | undefined): CacheTtl | null {
+  if (!split) return null
+  const long = split.ephemeral_1h_input_tokens
+  const short = split.ephemeral_5m_input_tokens
+  if (long + short <= 0) return null
+  return long >= short ? '1h' : '5m'
+}
+
+/**
+ * Subscription logins report the five-hour and seven-day usage windows;
+ * per-token billing reports none (a gateway may report a spend limit). Before
+ * the first response nothing is reported either way.
+ */
+export function billingFrom(rateLimitKinds: readonly string[], hasResponded: boolean): Billing {
+  if (rateLimitKinds.some(kind => kind === 'five_hour' || kind === 'seven_day')) return 'subscription'
+  return hasResponded ? 'api' : 'unknown'
+}
+
+/** The main conversation's TTL, whether or not it has made a request yet. */
+export function mainTtl(loops: readonly LoopStat[], ctx: TtlContext): CacheTtl {
+  const main = loops.find(l => l.id === MAIN)
+  return main ? main.ttl : resolveTtl(MAIN, null, ctx).ttl
+}
+
+export function describeTtlSource(source: TtlSource): string {
+  switch (source) {
+    case 'setting':
+      return 'set in /config'
+    case 'engine':
+      return 'reported by Claude Code'
+    case 'agent-result':
+      return "from the subagent's usage"
+    case 'observed':
+      return 'seen in a cache read'
+    case 'plan':
+      return 'usual for this billing'
+    case 'default':
+      return 'assumed'
+  }
 }
 
 export function newLoop(id: string, label: string, agentType: string, model: string, now: number): LoopStat {
@@ -58,6 +134,10 @@ export function newLoop(id: string, label: string, agentType: string, model: str
     startedAt: now,
     lastStepAt: 0,
     isDone: false,
+    ttl: '5m',
+    ttlSource: 'default',
+    ttlEvidence: null,
+    writeBaseUsd: 0,
   }
 }
 
@@ -73,8 +153,12 @@ export type StepFacts = {
 /**
  * Folds one request into its loop, and says whether that request rewrote the
  * cache: most of what the loop had cached was written again instead of read.
+ * A request that still read the cache after more than 5 minutes idle proves
+ * the loop caches for an hour.
  */
-export function applyStep(loop: LoopStat, step: StepFacts, ttl: CacheTtl): { loop: LoopStat; reset: CacheReset | null } {
+export function applyStep(current: LoopStat, step: StepFacts, ctx: TtlContext): { loop: LoopStat; reset: CacheReset | null } {
+  const loop = retime(current, ctx)
+  const ttl = loop.ttl
   const { usage, model, startedAt } = step
   const prompt = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
   const previous = loop.contextTokens
@@ -106,6 +190,13 @@ export function applyStep(loop: LoopStat, step: StepFacts, ttl: CacheTtl): { loo
     }
   }
 
+  const gapMs = startedAt - loop.lastStepAt
+  const readAfterIdle =
+    loop.steps > 0 &&
+    previous >= REWRITE_MIN_TOKENS &&
+    gapMs > ttlMs('5m') &&
+    usage.cache_read_input_tokens >= previous * REWRITE_SHARE
+
   const next: LoopStat = {
     ...loop,
     model,
@@ -117,12 +208,13 @@ export function applyStep(loop: LoopStat, step: StepFacts, ttl: CacheTtl): { loo
     cacheRead: loop.cacheRead + usage.cache_read_input_tokens,
     cacheWrite: loop.cacheWrite + usage.cache_creation_input_tokens,
     usd: loop.usd + usageUsd(model, usage, ttl),
+    writeBaseUsd: loop.writeBaseUsd + writeBaseUsd(model, usage),
     lastStepAt: startedAt,
     resets: reset ? [...loop.resets, reset].slice(-RESETS_KEPT) : loop.resets,
     resetCount: loop.resetCount + (reset ? 1 : 0),
     resetExtraUsd: loop.resetExtraUsd + (reset?.extraUsd ?? 0),
   }
-  return { loop: next, reset }
+  return { loop: readAfterIdle ? withEvidence(next, { ttl: '1h', source: 'observed' }, ctx) : next, reset }
 }
 
 /** Share of prompt tokens served from the cache across the given loops, 0 to 1. */
@@ -255,14 +347,16 @@ export function advise(
   loops: readonly LoopStat[],
   now: number,
   options: Options,
+  billing: Billing,
 ): Advice[] {
   const out: Advice[] = []
   const main = loops.find(l => l.id === MAIN)
   const model = main?.model || snapshot?.model || 'claude-opus-5-5'
   const subs = loops.filter(l => l.id !== MAIN)
+  const ttl = mainTtl(loops, { setting: options.cacheTtl, billing })
 
   if (snapshot) {
-    const w = windowFacts(snapshot, model, options.cacheTtl)
+    const w = windowFacts(snapshot, model, ttl)
     if (w.percentOfCompact !== null && w.tokensToCompact !== null) {
       if (w.percentOfCompact >= 95) {
         out.push({
@@ -288,7 +382,7 @@ export function advise(
     if (mcp && mcp.tokens >= Math.max(10_000, snapshot.windowTokens * 0.05)) {
       out.push({
         level: 'info',
-        text: `MCP tools hold ${fmtTokens(mcp.tokens)} (${fmtUsd(categoryUsd(model, mcp.tokens, options.cacheTtl))}/request). Disable servers you are not using in /mcp.`,
+        text: `MCP tools hold ${fmtTokens(mcp.tokens)} (${fmtUsd(categoryUsd(model, mcp.tokens, ttl))}/request). Disable servers you are not using in /mcp.`,
       })
     }
 
@@ -319,7 +413,7 @@ export function advise(
     const why =
       recent.reset.cause === 'idle'
         ? recent.loop.id === MAIN
-          ? `after ${fmtDuration(recent.reset.idleMs)} idle. Replies within ${options.cacheTtl} keep the cache warm.`
+          ? `after ${fmtDuration(recent.reset.idleMs)} idle. Replies within ${recent.loop.ttl === '1h' ? 'an hour' : '5 minutes'} keep the cache warm.`
           : `after ${fmtDuration(recent.reset.idleMs)} between requests. Keep slow commands and waits out of subagents, or resume them sooner.`
         : recent.reset.cause === 'model'
           ? 'after a model switch. Caches are per model: switch models at task boundaries, not mid-thread.'
@@ -344,8 +438,8 @@ export function advise(
   }
 
   if (main && snapshot && main.lastStepAt > 0) {
-    const left = ttlMs(options.cacheTtl) - (now - main.lastStepAt)
-    const w = windowFacts(snapshot, model, options.cacheTtl)
+    const left = ttlMs(main.ttl) - (now - main.lastStepAt)
+    const w = windowFacts(snapshot, model, main.ttl)
     if (left > 0 && left < 90_000 && w.perRequest.cold - w.perRequest.warm >= 0.05) {
       out.push({
         level: 'info',
@@ -368,6 +462,7 @@ export function warnings(
   loops: readonly LoopStat[],
   warned: readonly string[],
   options: Options,
+  billing: Billing,
 ): Warning[] {
   const out: Warning[] = []
   const has = (key: string) => warned.includes(key)
@@ -375,7 +470,7 @@ export function warnings(
   const model = main?.model || snapshot?.model || 'claude-opus-5-5'
 
   if (snapshot) {
-    const w = windowFacts(snapshot, model, options.cacheTtl)
+    const w = windowFacts(snapshot, model, mainTtl(loops, { setting: options.cacheTtl, billing }))
     if (w.percentOfCompact !== null && w.tokensToCompact !== null) {
       if (w.percentOfCompact >= 95 && !has('compact-95')) {
         out.push({ key: 'compact-95', text: `Context: auto-compact in ${fmtTokens(w.tokensToCompact)}. /compact <focus> now to choose what is kept.` })

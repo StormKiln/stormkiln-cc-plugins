@@ -30,6 +30,20 @@ export type CacheReset = {
   idleMs: number
 }
 
+/** A prompt-cache lifetime. */
+export type CacheTtl = '5m' | '1h'
+
+/** How the session is billed: a subscription login, or per token (API key, Bedrock, Vertex, a gateway). */
+export type Billing = 'subscription' | 'api' | 'unknown'
+
+/**
+ * Where a loop's cache TTL came from, strongest first: the person's setting;
+ * Claude Code's own report (a model switch); the subagent's final usage, which
+ * splits its writes by TTL; a cache read seen after more than 5 minutes idle;
+ * the billing type's usual TTL; or the 5-minute default.
+ */
+export type TtlSource = 'setting' | 'engine' | 'agent-result' | 'observed' | 'plan' | 'default'
+
 /** Running totals for one model loop: the main conversation or a subagent. */
 export type LoopStat = {
   id: string
@@ -50,12 +64,22 @@ export type LoopStat = {
   startedAt: number
   lastStepAt: number
   isDone: boolean
+  /** The TTL this loop's cache writes are priced at and its idle expiry is judged by. */
+  ttl: CacheTtl
+  ttlSource: TtlSource
+  /** The strongest direct evidence of this loop's TTL seen so far. */
+  ttlEvidence: { ttl: CacheTtl; source: 'engine' | 'agent-result' | 'observed' } | null
+  /** Cache writes at the plain input rate, so `usd` can be re-priced when `ttl` changes. */
+  writeBaseUsd: number
 }
 
 declare module 'claude-code' {
   interface PluginState {
     'context-bar': {
       isVisible: boolean
+      /** Set by `/context-bar on|off --here`: this session stops following the shared on/off. */
+      isSessionOnly: boolean
+      billing: Billing
       snapshot: ContextSnapshot | null
       loops: LoopStat[]
       warned: string[]

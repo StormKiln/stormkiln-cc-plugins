@@ -9,7 +9,7 @@
       "name": "context-bar",
       "source": "./plugins/context-bar",
       "description": "A stacked context-window bar above the prompt, colored like /context, with cost estimates, compaction and cost warnings, and per-subagent cache-rewrite tracking.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "category": "productivity",
       "keywords": ["context", "cost", "cache", "subagents", "tokens"]
     }
