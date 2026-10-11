@@ -33,12 +33,13 @@ To update later: `claude plugin update context-bar@stormkiln-cc-plugins`, then `
 .claude-plugin/marketplace.json   the marketplace: lists each plugin and where it lives
 plugins/<name>/                   one folder per plugin, with its own README
 Makefile                          make check: validate and test every plugin
+.github/workflows/check.yml       runs make check on every pull request and push to main
 ```
 
 ## Contributing
 
 1. Add the plugin under `plugins/<name>/` with a `.claude-plugin/plugin.json` and a README.
 2. List it in `.claude-plugin/marketplace.json`.
-3. Run `make check` and open a pull request.
+3. Run `make check` and open a pull request. CI runs the same check with a pinned Claude Code CLI; bump `CLAUDE_CODE_VERSION` in the workflow to move it.
 
 MIT licensed.

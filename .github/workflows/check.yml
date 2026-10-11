@@ -1,0 +1,23 @@
+name: check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Pinned so a new CLI release cannot change what validate accepts under
+      # a PR; bump CLAUDE_CODE_VERSION on purpose. No login is needed.
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+        env:
+          CLAUDE_CODE_VERSION: 2.1.296
+      - run: claude --version
+      - run: make check
