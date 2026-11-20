@@ -188,34 +188,40 @@ export function bundledEntryFor(launcherRealPath: string): string {
   return joinPath(bundleRootFor(launcherRealPath), 'lib', 'dist', 'bin', 'codegraph.js')
 }
 
+/** An npm install's entry script, beside its `.cmd` shim in the npm prefix. */
+export function npmEntryFor(shimPath: string): string {
+  return joinPath(dirname(shimPath), 'node_modules', '@colbymchenry', 'codegraph', 'dist', 'bin', 'codegraph.js')
+}
+
+/** The flags CodeGraph's own launcher gives its bundled Node. */
+export const BUNDLE_NODE_FLAGS = ['--liftoff-only', '--disable-warning=ExperimentalWarning', '--max-semi-space-size=16']
+
 /** How to start CodeGraph on this host, everything absolute. */
 export type Tooling = {
   /** The launcher found on PATH. */
   launcher: string
   /** A Node runtime for our copy script: CodeGraph's own, else PATH's. */
   node: string | null
-  /** CodeGraph's own Node and its entry script, when it is a bundle install. */
-  bundle: { node: string; entry: string } | null
+  /** A Node and CodeGraph's entry script, to start it with no launcher (used on Windows). */
+  direct: { node: string; entry: string; flags: readonly string[] } | null
   /** cmd.exe by absolute path (Windows only). */
   comspec: string | null
 }
-
-/** The flags CodeGraph's own launcher gives its bundled Node. */
-const BUNDLE_NODE_FLAGS = ['--liftoff-only', '--disable-warning=ExperimentalWarning', '--max-semi-space-size=16']
 
 /** Characters cmd.exe gives meaning to on its command line. */
 const CMD_META = /["&|<>^%!()\r\n]/
 
 /**
  * The argument vector that runs `codegraph <args>`, or null when it cannot be
- * started safely. On Windows a bundle install runs its own node.exe on its
- * entry script, with no cmd.exe at all; a `.cmd` shim (an npm install) runs
- * through cmd.exe named by absolute path, its own absolute path checked for
- * anything cmd.exe would parse. Every `args` value here is a fixed word.
+ * started safely. On Windows CodeGraph runs as Node on its entry script (a
+ * bundle's own node.exe, or an npm install's script with PATH's node), with
+ * no cmd.exe at all; only a `.cmd` shim with no script found beside it runs
+ * through cmd.exe, named by absolute path, its own path checked for anything
+ * cmd.exe would parse. Every `args` value here is a fixed word.
  */
 export function codegraphArgv(tools: Tooling, platform: Platform, args: readonly string[]): string[] | null {
   if (!isWindows(platform)) return [tools.launcher, ...args]
-  if (tools.bundle) return [tools.bundle.node, ...BUNDLE_NODE_FLAGS, tools.bundle.entry, ...args]
+  if (tools.direct) return [tools.direct.node, ...tools.direct.flags, tools.direct.entry, ...args]
   if (/\.exe$/i.test(tools.launcher)) return [tools.launcher, ...args]
   if (!tools.comspec || CMD_META.test(tools.launcher)) return null
   return [tools.comspec, '/d', '/c', tools.launcher, ...args]
@@ -281,6 +287,8 @@ export type CloneReport = {
   method?: string
   reason?: string
   checked?: boolean
+  /** Skipped because the source index is not finished (no point retrying soon). */
+  unfinished?: boolean
 }
 
 export function parseCloneReport(stdout: string): CloneReport {
@@ -295,6 +303,7 @@ export function parseCloneReport(stdout: string): CloneReport {
           method: typeof v.method === 'string' ? v.method : undefined,
           reason: typeof v.reason === 'string' ? v.reason : undefined,
           checked: typeof v.checked === 'boolean' ? v.checked : undefined,
+          unfinished: v.unfinished === true ? true : undefined,
         }
       }
     }
@@ -304,23 +313,27 @@ export function parseCloneReport(stdout: string): CloneReport {
   return { status: 'failed', reason: `unreadable output: ${line.slice(0, 200)}` }
 }
 
-/** What `codegraph status --json` says about an index's last run, or null. */
-export type IndexHealth = { projectPath: string; state: string; rebuildInProgress: boolean }
+/** What the clone script's `--probe` says about an index. */
+export type Probe = { state: string; writing: boolean; broken: boolean }
 
-export function parseStatus(stdout: string): IndexHealth | null {
+export function parseProbe(stdout: string): Probe | null {
+  const line = stdout.trim().split(/\r?\n/).pop() ?? ''
   try {
-    const d = JSON.parse(stdout) as Record<string, unknown>
-    const index = (d.index ?? {}) as Record<string, unknown>
-    if (typeof d.projectPath !== 'string' || typeof index.state !== 'string') return null
-    return { projectPath: d.projectPath, state: index.state, rebuildInProgress: d.rebuildInProgress === true }
+    const v = JSON.parse(line) as Record<string, unknown>
+    if (v.status !== 'probed' || typeof v.state !== 'string') return null
+    return { state: v.state, writing: v.writing === true, broken: v.broken === true }
   } catch {
     return null
   }
 }
 
-/** A run that was killed, dropped files or failed: `codegraph sync` finishes it. */
-export const isUnfinished = (h: IndexHealth): boolean =>
-  !h.rebuildInProgress && (h.state === 'indexing' || h.state === 'partial' || h.state === 'failed')
+/**
+ * An index to rebuild with `codegraph index`: one a run left unfinished
+ * (killed, dropped files, failed) or SQLite cannot read, and that nothing is
+ * writing now. `codegraph sync` finishes none of these; `index` does.
+ */
+export const needsRebuild = (p: Probe): boolean =>
+  !p.writing && (p.broken || p.state === 'indexing' || p.state === 'partial' || p.state === 'failed')
 
 export const INSTALL_HINT =
   'Install it with `curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | bash` ' +
@@ -337,8 +350,11 @@ export function contextFor(outcome: Outcome): string | null {
         `codegraph-worktree: this git worktree had no CodeGraph index, so one was copied from ${outcome.from} ` +
         `and is syncing to this branch. Pass projectPath="${outcome.root}" to codegraph tools so results come from this worktree's own index.`
       )
-    case 'initializing':
     case 'pending':
+      return outcome.isLinked
+        ? `codegraph-worktree: CodeGraph's index for this worktree (${outcome.root}) is still being checked or prepared. Until a later note says it is ready, codegraph tools may answer from another tree's index; pass projectPath="${outcome.root}" once it is.`
+        : null
+    case 'initializing':
       return outcome.isLinked
         ? `codegraph-worktree: a CodeGraph index for this worktree is being built at ${outcome.root}. Pass projectPath="${outcome.root}" to codegraph tools; until it is ready they may answer from another tree or not at all.`
         : `codegraph-worktree: CodeGraph is building this repository's index in the background (${outcome.root}); codegraph tools may be incomplete for a few minutes.`

@@ -247,7 +247,7 @@ async function verify(dbPath) {
     if (tables.has('project_metadata')) {
       const row = db.prepare("SELECT value FROM project_metadata WHERE key = 'index_state'").get()
       if (row && row.value !== 'complete') {
-        throw Object.assign(new Error(`the source index is ${row.value}, not complete`), { skip: true })
+        throw Object.assign(new Error(`the source index is ${row.value}, not complete`), { skip: true, unfinished: true })
       }
     }
     // Fold the WAL into the database, so the copy placed is one file.
@@ -284,13 +284,13 @@ function destState(dest) {
 
 /**
  * Places the built index at `dest` without ever replacing anything; false
- * when another process got there first. The folder is made with mkdir, which
- * fails rather than take over a folder someone else just made; the database
+ * when another process got there first. The folder is made with mkdir (one
+ * someone else just made is used as it is, never replaced); the database
  * then goes in by hard link, which fails rather than replace one. Until that
  * link, everything in the folder is a file that leaves it "empty enough" for
  * the next run, so a kill at any point never blocks a later copy.
  */
-function place(tmp, dest) {
+function place(tmp, dest, ignoreText) {
   try {
     fs.mkdirSync(dest)
   } catch (err) {
@@ -298,16 +298,16 @@ function place(tmp, dest) {
   }
   if (destState(dest) !== 'empty') return false
   const made = []
-  const putIfAbsent = (name) => {
+  const putIfAbsent = (name, content) => {
     try {
-      fs.copyFileSync(path.join(tmp, name), path.join(dest, name), fs.constants.COPYFILE_EXCL)
+      fs.writeFileSync(path.join(dest, name), content, { flag: 'wx' })
       made.push(name)
     } catch (err) {
       if (err.code !== 'EEXIST') throw err
     }
   }
-  putIfAbsent(GITIGNORE)
-  putIfAbsent(SYNC_MARKER)
+  putIfAbsent(GITIGNORE, ignoreText)
+  putIfAbsent(SYNC_MARKER, fs.readFileSync(path.join(tmp, SYNC_MARKER)))
   const target = path.join(dest, DB)
   try {
     fs.linkSync(path.join(tmp, DB), target)
@@ -328,7 +328,39 @@ function place(tmp, dest) {
   }
 }
 
+// `--probe <index dir>`: how an index stands, for the mod's health check,
+// read straight from its database (far cheaper than `codegraph status`):
+// { state, writing, broken? } where `writing` means a CodeGraph process holds
+// its lock and `broken` that SQLite cannot read it.
+async function probe(dir) {
+  const writing =
+    heldByLiveProcess(path.join(dir, 'codegraph.lock')) || heldByLiveProcess(path.join(dir, 'rebuild.pid'))
+  let sqlite
+  try {
+    sqlite = await import('node:sqlite')
+  } catch {
+    return out({ status: 'probed', state: 'unknown', writing })
+  }
+  try {
+    const db = new sqlite.DatabaseSync(path.join(dir, DB), { readOnly: true })
+    try {
+      db.exec('PRAGMA busy_timeout = 2000')
+      const row = db.prepare("SELECT value FROM project_metadata WHERE key = 'index_state'").get()
+      // A cheap read of the biggest table's root pages: a database a killed
+      // init left without a journal usually fails here.
+      db.prepare('SELECT count(*) AS c FROM files').get()
+      out({ status: 'probed', state: row?.value ?? 'unknown', writing })
+    } finally {
+      db.close()
+    }
+  } catch (err) {
+    const busy = /SQLITE_BUSY|locked/i.test(String(err?.message))
+    out({ status: 'probed', state: 'unknown', writing: writing || busy, broken: !busy, reason: String(err?.message ?? err).slice(0, 200) })
+  }
+}
+
 async function main() {
+  if (process.argv[2] === '--probe') return probe(path.resolve(process.argv[3] ?? '.'))
   const [srcArg, rootArg, nameArg = '.codegraph', scratchArg] = process.argv.slice(2)
   if (!srcArg || !rootArg) {
     out({ status: 'failed', reason: 'usage: clone-index.mjs <source index dir> <destination root> [index dir name] [scratch dir]' })
@@ -366,10 +398,11 @@ async function main() {
   fs.mkdirSync(tmp)
   try {
     // First, so git never shows the copy while it is being made, even when
-    // it is made beside the worktree's files.
+    // it is made beside the worktree's files: a bare `*` hides the folder
+    // whole, itself included. The source's own rules go in at placing.
+    fs.writeFileSync(path.join(tmp, GITIGNORE), '*\n')
     const srcIgnore = path.join(srcDir, GITIGNORE)
-    if (fs.existsSync(srcIgnore)) fs.copyFileSync(srcIgnore, path.join(tmp, GITIGNORE))
-    else fs.writeFileSync(path.join(tmp, GITIGNORE), DEFAULT_GITIGNORE)
+    const ignoreText = fs.existsSync(srcIgnore) ? fs.readFileSync(srcIgnore) : DEFAULT_GITIGNORE
 
     const state = { method: undefined, apfs: undefined }
     let settled = false
@@ -407,7 +440,7 @@ async function main() {
     } catch (err) {
       if (err.skip) {
         removeOwnTmp(tmp)
-        return out({ status: 'skipped', reason: err.message })
+        return out({ status: 'skipped', reason: err.message, unfinished: err.unfinished === true })
       }
       throw err
     }
@@ -421,7 +454,7 @@ async function main() {
     // made while checking, belong to this folder alone.
     for (const f of [WAL, SHM]) fs.rmSync(path.join(tmp, f), { force: true })
 
-    const placed = place(tmp, dest)
+    const placed = place(tmp, dest, ignoreText)
     removeOwnTmp(tmp)
     out(placed ? { status: 'copied', method: state.method, checked } : { status: 'exists' })
   } catch (err) {

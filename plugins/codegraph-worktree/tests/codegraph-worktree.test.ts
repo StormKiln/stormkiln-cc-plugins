@@ -10,12 +10,12 @@ import {
   indexDirName,
   isEmptyIndexDir,
   isLinkedWorktree,
-  isUnfinished,
+  needsRebuild,
   joinPath,
   movedContext,
   parseCloneReport,
   parseRevParse,
-  parseStatus,
+  parseProbe,
   parseWorktreeList,
   pathCandidates,
   pathKey,
@@ -102,14 +102,14 @@ describe('PATH search', () => {
 })
 
 describe('command lines', () => {
-  const tools = (t: Partial<Tooling>): Tooling => ({ launcher: '', node: null, bundle: null, comspec: null, ...t })
+  const tools = (t: Partial<Tooling>): Tooling => ({ launcher: '', node: null, direct: null, comspec: null, ...t })
 
   test('POSIX runs the launcher found on PATH', async () => {
     expect(codegraphArgv(tools({ launcher: '/usr/local/bin/codegraph' }), 'linux', ['init', '-y'])).toEqual(['/usr/local/bin/codegraph', 'init', '-y'])
   })
 
   test('a Windows bundle runs its own node.exe on its entry script, no cmd.exe', async () => {
-    const argv = codegraphArgv(tools({ launcher: 'C:/u/bin/codegraph.cmd', bundle: { node: 'C:/cg/node.exe', entry: 'C:/cg/lib/dist/bin/codegraph.js' } }), 'windows', ['sync'])
+    const argv = codegraphArgv(tools({ launcher: 'C:/u/bin/codegraph.cmd', direct: { node: 'C:/cg/node.exe', entry: 'C:/cg/lib/dist/bin/codegraph.js', flags: ['--liftoff-only'] } }), 'windows', ['sync'])
     expect(argv?.[0]).toBe('C:/cg/node.exe')
     expect(argv?.slice(-2)).toEqual(['C:/cg/lib/dist/bin/codegraph.js', 'sync'])
   })
@@ -178,14 +178,17 @@ describe('the copy script report', () => {
   })
 })
 
-describe('codegraph status', () => {
-  test('a killed or failed run is unfinished; a rebuild under way is not', async () => {
-    const h = parseStatus('{"projectPath":"/r","rebuildInProgress":false,"index":{"state":"indexing"}}')
-    expect(h).toEqual({ projectPath: '/r', state: 'indexing', rebuildInProgress: false })
-    expect(isUnfinished(h!)).toBe(true)
-    expect(isUnfinished({ projectPath: '/r', state: 'complete', rebuildInProgress: false })).toBe(false)
-    expect(isUnfinished({ projectPath: '/r', state: 'indexing', rebuildInProgress: true })).toBe(false)
-    expect(parseStatus('not json')).toBe(null)
+describe('index health', () => {
+  test('rebuild what a run left unfinished or unreadable, never while it is being written', async () => {
+    const p = parseProbe('{"status":"probed","state":"indexing","writing":false,"ms":3}')
+    expect(p).toEqual({ state: 'indexing', writing: false, broken: false })
+    expect(needsRebuild(p!)).toBe(true)
+    expect(needsRebuild({ state: 'partial', writing: false, broken: false })).toBe(true)
+    expect(needsRebuild({ state: 'failed', writing: false, broken: false })).toBe(true)
+    expect(needsRebuild({ state: 'unknown', writing: false, broken: true })).toBe(true)
+    expect(needsRebuild({ state: 'indexing', writing: true, broken: false })).toBe(false)
+    expect(needsRebuild({ state: 'complete', writing: false, broken: false })).toBe(false)
+    expect(parseProbe('not json')).toBe(null)
   })
 })
 
@@ -224,6 +227,7 @@ function host(on: On, opts: { installed?: boolean; worktreeIndexed?: boolean } =
   const runs: Run[] = []
   const detached: Run[] = []
   const states = new Map<string, string>()
+  const cloneReply: string[] = []
   const spawns: Run[] = []
   const toasts: string[] = []
   const store = new Map<string, unknown>()
@@ -262,14 +266,18 @@ function host(on: On, opts: { installed?: boolean; worktreeIndexed?: boolean } =
     if (cmd === '/usr/bin/git' && args[0] === 'worktree') {
       return ok('worktree /r\nHEAD 1\nbranch refs/heads/main\n\nworktree /r-wt\nHEAD 2\nbranch refs/heads/x\n')
     }
+    if (cmd === '/home/u/.codegraph/versions/v1/node' && args[1] === '--probe') {
+      const root = (args[2] ?? '').replace(/\/\.codegraph$/, '')
+      return ok(JSON.stringify({ status: 'probed', state: states.get(root) ?? 'complete', writing: false }))
+    }
+    if (cmd === '/home/u/.codegraph/versions/v1/node' && cloneReply.length > 0) {
+      return ok(`${cloneReply.shift()}\n`)
+    }
     if (cmd === '/home/u/.codegraph/versions/v1/node') {
       files.add('/r-wt/.codegraph/codegraph.db')
       return ok('{"status":"copied","method":"clone","checked":true,"ms":3}\n')
     }
-    if (cmd === '/home/u/.local/bin/codegraph' && args[0] === 'status') {
-      const root = e.init?.cwd ?? ''
-      return ok(JSON.stringify({ projectPath: root, rebuildInProgress: false, index: { state: states.get(root) ?? 'complete' } }))
-    }
+
     if (cmd === '/bin/sh') {
       detached.push({ argv: e.argv.slice(4), cwd: e.init?.cwd })
       return ok('')
@@ -313,7 +321,7 @@ function host(on: On, opts: { installed?: boolean; worktreeIndexed?: boolean } =
   on('classic.PostToolUse', () => ({}))
   on('classic.CwdChanged', () => ({}))
   on('classic.UserPromptSubmit', () => ({}))
-  return { runs, spawns, toasts, store, files, texts, detached, states, setSessionCwd: (d: string) => (sessionCwd = d) }
+  return { runs, spawns, toasts, store, files, texts, detached, states, cloneReply, setSessionCwd: (d: string) => (sessionCwd = d) }
 }
 
 describe('session start', () => {
@@ -335,14 +343,14 @@ describe('session start', () => {
     await settle()
     expect(h.spawns).toEqual([])
     expect(h.detached).toEqual([])
-    expect(h.runs.filter((r) => r.argv[0] !== '/usr/bin/git').map((r) => r.argv.slice(1))).toEqual([['status', '--json']])
+    expect(h.runs.filter((r) => r.argv[0] !== '/usr/bin/git').map((r) => r.argv[2])).toEqual(['--probe'])
     expect(result.additionalContext ?? []).toEqual([])
   })
 
   test('a worktree that already has its own index is not copied into', async ($, on) => {
     const h = host(on, { worktreeIndexed: true })
     await $.classic.SessionStart({ source: 'startup', cwd: '/r-wt' } as never)
-    expect(h.runs.some((r) => r.argv[0] === '/home/u/.codegraph/versions/v1/node')).toBe(false)
+    expect(h.runs.some((r) => r.argv[0] === '/home/u/.codegraph/versions/v1/node' && r.argv[2] !== '--probe')).toBe(false)
   })
 
   test('finishes a sync an earlier session left pending, and marks it done', async ($, on) => {
@@ -390,7 +398,31 @@ describe('session start', () => {
     h.states.set('/r', 'indexing')
     await $.classic.SessionStart({ source: 'startup', cwd: '/r' } as never)
     await settle()
-    expect(h.detached).toEqual([{ argv: ['/home/u/.local/bin/codegraph', 'sync'], cwd: '/r' }])
+    expect(h.detached).toEqual([{ argv: ['/home/u/.local/bin/codegraph', 'index', '-q'], cwd: '/r' }])
+  })
+
+  test('a partial or failed index is rebuilt too, and not again within hours', async ($, on) => {
+    const h = host(on)
+    h.states.set('/r', 'partial')
+    await $.classic.SessionStart({ source: 'startup', cwd: '/r' } as never)
+    await settle()
+    expect(h.detached.length).toBe(1)
+  })
+
+  test('a worktree whose only source is unfinished gets its own init, not nothing', async ($, on) => {
+    const h = host(on)
+    h.cloneReply.push('{"status":"skipped","reason":"the source index is partial, not complete","unfinished":true}')
+    await $.classic.SessionStart({ source: 'startup', cwd: '/r-wt' } as never)
+    expect(h.detached).toEqual([{ argv: ['/home/u/.local/bin/codegraph', 'init', '-y'], cwd: '/r-wt' }])
+  })
+
+  test('a failed copy is retried next session, and only a second failure starts an init', async ($, on) => {
+    const h = host(on)
+    h.cloneReply.push('{"status":"failed","reason":"disk full"}', '{"status":"failed","reason":"disk full"}')
+    await $.classic.SessionStart({ source: 'startup', cwd: '/r-wt' } as never)
+    expect(h.detached).toEqual([])
+    await $.classic.SessionStart({ source: 'resume', cwd: '/r-wt' } as never)
+    expect(h.detached).toEqual([{ argv: ['/home/u/.local/bin/codegraph', 'init', '-y'], cwd: '/r-wt' }])
   })
 
   test('a worktree that checked out a committed .codegraph/.gitignore still gets a copy', async ($, on) => {

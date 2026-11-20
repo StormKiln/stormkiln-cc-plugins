@@ -10,7 +10,9 @@ import {
   indexDirName,
   isEmptyIndexDir,
   isLinkedWorktree,
-  isUnfinished,
+  BUNDLE_NODE_FLAGS,
+  needsRebuild,
+  npmEntryFor,
   isWindows,
   joinPath,
   linkedRoot,
@@ -18,7 +20,7 @@ import {
   noticeFor,
   parseCloneReport,
   parseRevParse,
-  parseStatus,
+  parseProbe,
   parseWorktreeList,
   pathCandidates,
   pathKey,
@@ -37,8 +39,8 @@ const GIT_TIMEOUT_MS = 10_000
 /** The copy itself: instant copy-on-write, seconds for a large full copy. */
 const COPY_TIMEOUT_MS = 120_000
 /** A source that keeps changing while it is copied: try again this often. */
-const COPY_RETRIES = 2
-const COPY_RETRY_DELAY_MS = 5_000
+const COPY_RETRIES = 1
+const COPY_RETRY_DELAY_MS = 2_000
 /** After starting `codegraph init` in a tree, leave that tree alone this long. */
 const INIT_HOLD_MS = 24 * 60 * 60 * 1000
 /** After repairing an unfinished index, wait this long before trying again. */
@@ -57,8 +59,8 @@ const healthChecked = new Set<string>()
 let platformOnce: Promise<Platform> | undefined
 let toolingFound: Tooling | undefined
 let gitFound: string | undefined
-/** The worktree the model was last told to pass as projectPath. */
-let toldProjectPath: string | null = null
+/** The worktree each loop (main, or a subagent by id) was last told to pass as projectPath. */
+const toldProjectPath = new Map<string, string>()
 /** Context for the next prompt, after a move no hook could report. */
 let noteForNextPrompt: string | null = null
 
@@ -114,7 +116,11 @@ async function gitOf($: $, platform: Platform): Promise<string | null> {
 
 /** Where CodeGraph is installed; looked up again each time until found. */
 async function toolingOf($: $, platform: Platform): Promise<Tooling | null> {
-  if (toolingFound) return toolingFound
+  // `codegraph upgrade` moves the bundle: look again if what was found is gone.
+  if (toolingFound && (await isFile($, toolingFound.launcher)) && (!toolingFound.node || (await isFile($, toolingFound.node)))) {
+    return toolingFound
+  }
+  toolingFound = undefined
   const home = await homeOf($)
   const pathExt = isWindows(platform) ? await $.env.get('PATHEXT') : undefined
   const candidates = pathCandidates('codegraph', await pathOf($), platform, pathExt)
@@ -124,11 +130,15 @@ async function toolingOf($: $, platform: Platform): Promise<Tooling | null> {
     const real = await isFile($, launcher)
     if (!real) continue
     const bundledNode = (await isFile($, bundledNodeFor(real, platform))) ? bundledNodeFor(real, platform) : null
-    const entry = bundledEntryFor(real)
-    const bundle = bundledNode && (await isFile($, entry)) ? { node: bundledNode, entry } : null
     const node = bundledNode ?? (await findOnPath($, 'node', platform))
+    let direct: Tooling['direct'] = null
+    if (bundledNode && (await isFile($, bundledEntryFor(real)))) {
+      direct = { node: bundledNode, entry: bundledEntryFor(real), flags: BUNDLE_NODE_FLAGS }
+    } else if (node && isWindows(platform) && (await isFile($, npmEntryFor(launcher)))) {
+      direct = { node, entry: npmEntryFor(launcher), flags: [] }
+    }
     const comspec = isWindows(platform) ? comspecFor(await $.env.get('ComSpec'), await $.env.get('SystemRoot')) : null
-    toolingFound = { launcher, node, bundle, comspec }
+    toolingFound = { launcher, node, direct, comspec }
     return toolingFound
   }
   return null
@@ -225,30 +235,44 @@ async function needsSync($: $, root: string, dirName: string): Promise<boolean> 
   return text?.trim() === 'pending'
 }
 
-/** Once per tree per process: finish an index run that was killed or failed. */
-function checkHealth($: $, root: string, platform: Platform, tools: Tooling) {
+/** How an index stands, read by the clone script's probe; null when it cannot tell. */
+async function probeIndex($: $, platform: Platform, tools: Tooling, indexDir: string) {
+  if (!tools.node) return null
+  const script = joinPath($.plugin.root, 'scripts', 'clone-index.mjs')
+  const r = await $.process.run([tools.node, script, '--probe', indexDir], { timeoutMs: 20_000, env: childEnv(platform) }).catch(() => undefined)
+  return r ? parseProbe(r.stdout) : null
+}
+
+/**
+ * Once per tree per process: rebuild an index a run left unfinished or
+ * unreadable (an init killed with the session, a reboot mid-index). Never
+ * while CodeGraph is writing it; at most every few hours per tree.
+ */
+function checkHealth($: $, root: string, platform: Platform, tools: Tooling, dirName: string) {
   const key = pathKey(root, platform)
   if (healthChecked.has(key)) return
   healthChecked.add(key)
   void (async () => {
-    const argv = codegraphArgv(tools, platform, ['status', '--json'])
-    if (!argv) return
-    const r = await $.process.run(argv, { cwd: root, timeoutMs: 60_000, env: childEnv(platform) }).catch(() => undefined)
-    const health = r ? parseStatus(r.stdout) : null
-    if (!health || pathKey(health.projectPath, platform) !== key || !isUnfinished(health)) return
+    const probe = await probeIndex($, platform, tools, joinPath(root, dirName))
+    if (!probe || !needsRebuild(probe)) return
     const holdKey = `repair:${key}`
     if (await heldSince($, holdKey, REPAIR_HOLD_MS)) return
-    // A run that is still going holds CodeGraph's lock; a sync then waits or stops.
-    const sync = codegraphArgv(tools, platform, ['sync'])
-    if (!sync) return
-    await hold($, holdKey)
-    debug($, `index in ${root} is ${health.state}; finishing it with codegraph sync`)
-    await startLong($, platform, sync, root, 'codegraph sync (repair)')
+    const argv = codegraphArgv(tools, platform, ['index', '-q'])
+    if (!argv) return
+    debug($, `index in ${root} is ${probe.broken ? 'unreadable' : probe.state}; rebuilding it with codegraph index`)
+    if (await startLong($, platform, argv, root, 'codegraph index (repair)')) await hold($, holdKey)
   })().catch((err) => debug($, `health check in ${root} failed: ${String(err)}`))
 }
 
 /** Copies an index from another worktree; null when none could be placed. */
-async function tryCopy($: $, root: string, gitDir: string, platform: Platform, tools: Tooling, dirName: string): Promise<Outcome | 'busy' | null> {
+/**
+ * Copies an index from another worktree. 'busy': a source is being written,
+ * try again later; 'failed': a copy went wrong; null: no usable source (none
+ * indexed, or none finished), so this tree needs its own init.
+ */
+async function tryCopy($: $, root: string, gitDir: string, platform: Platform, tools: Tooling, dirName: string): Promise<Outcome | 'busy' | 'failed' | null> {
+  // No sync to bring a copy to this branch: a copy would stay on another's.
+  if (!codegraphArgv(tools, platform, ['sync'])) return null
   if (!tools.node) {
     debug($, 'no Node runtime found next to codegraph or on PATH; cannot copy an index')
     return null
@@ -260,12 +284,11 @@ async function tryCopy($: $, root: string, gitDir: string, platform: Platform, t
   for (let attempt = 0; attempt <= COPY_RETRIES; attempt++) {
     if (attempt > 0) await $.clock.sleep(COPY_RETRY_DELAY_MS)
     let busy = false
-    let anySource = false
+    let failed = false
     for (const source of sourceCandidates(parseWorktreeList(list), root, platform)) {
       if (unsafeRootReason(source, home, platform)) continue
       const sourceIndex = joinPath(source, dirName)
       if (!(await $.fs.exists(joinPath(sourceIndex, 'codegraph.db')))) continue
-      anySource = true
       const r = await $.process
         .run([tools.node, script, sourceIndex, root, dirName, gitDir], { timeoutMs: COPY_TIMEOUT_MS, env: childEnv(platform) })
         .catch((err) => ({ exitCode: -1, stdout: JSON.stringify({ status: 'failed', reason: String(err) }), stderr: '' }))
@@ -275,10 +298,11 @@ async function tryCopy($: $, root: string, gitDir: string, platform: Platform, t
         return { kind: 'copied', root, from: source, method: report.method ?? 'copy' }
       }
       if (report.status === 'exists') return { kind: 'ready', root, isLinked: true }
-      if (report.status === 'skipped') busy = true
+      if (report.status === 'skipped' && !report.unfinished) busy = true
+      if (report.status === 'failed') failed = true
       debug($, `copy from ${source} ${report.status}: ${report.reason ?? ''}`)
     }
-    if (!anySource || !busy) return null
+    if (!busy) return failed ? 'failed' : null
   }
   return 'busy'
 }
@@ -296,7 +320,7 @@ async function ensureRoot($: $, root: string, gitDir: string, isLinked: boolean,
     const tools = await toolingOf($, platform)
     if (tools) {
       if (isLinked && (await needsSync($, root, dirName))) startSync($, root, platform, tools, dirName)
-      else checkHealth($, root, platform, tools)
+      else checkHealth($, root, platform, tools, dirName)
     }
     return { kind: 'ready', root, isLinked }
   }
@@ -317,6 +341,16 @@ async function ensureRoot($: $, root: string, gitDir: string, isLinked: boolean,
   if (isLinked && config.copyIntoWorktrees) {
     const copied = await tryCopy($, root, gitDir, platform, tools, dirName)
     if (copied === 'busy') return { kind: 'left-alone', root, isLinked, why: 'the source index is busy; trying again next session' }
+    if (copied === 'failed') {
+      // A copy can fail for passing reasons (a full disk, a timeout): try it
+      // again next session, and index from scratch only when it fails twice.
+      const key = `copy-failed:${pathKey(root, platform)}`
+      if (!(await heldSince($, key, INIT_HOLD_MS))) {
+        await hold($, key)
+        return { kind: 'left-alone', root, isLinked, why: 'the copy failed; trying again next session' }
+      }
+      return startInit($, root, platform, tools, isLinked, 'copying an index failed twice')
+    }
     if (copied) return copied
     return startInit($, root, platform, tools, isLinked, 'no index to copy from another worktree')
   }
@@ -357,7 +391,7 @@ function ensureIndex($: $, dir: string, progress: Progress = {}): Promise<Outcom
 }
 
 /** The outcome, or `pending` once the budget runs out (the work runs on). */
-async function ensureWithin($: $, dir: string, ms: number): Promise<Outcome> {
+async function ensureWithin($: $, dir: string, ms: number, loop = 'main'): Promise<Outcome> {
   const progress: Progress = {}
   let timedOut = false
   const work = ensureIndex($, dir, progress)
@@ -367,7 +401,20 @@ async function ensureWithin($: $, dir: string, ms: number): Promise<Outcome> {
     return progress.root ? { kind: 'pending', root: progress.root, isLinked: progress.isLinked ?? false } : { kind: 'not-git' }
   })
   const outcome = await Promise.race([work, timer])
-  if (timedOut) void work.then((o) => tell($, o)).catch(() => undefined)
+  if (timedOut && loop !== 'main') void work.then((o) => tell($, o)).catch(() => undefined)
+  if (timedOut && loop === 'main') {
+    // The hook already said "still being checked"; say how it came out.
+    void work
+      .then(async (o) => {
+        await tell($, o)
+        const linked = linkedRoot(o)
+        if (linked) toldProjectPath.set('main', linked)
+        noteForNextPrompt =
+          contextFor(o) ??
+          (progress.isLinked ? `codegraph-worktree: no CodeGraph index could be prepared for this worktree (${progress.root}) yet; codegraph tools answer from another tree's index or none.` : null)
+      })
+      .catch(() => undefined)
+  }
   return outcome
 }
 
@@ -391,7 +438,8 @@ async function tell($: $, outcome: Outcome): Promise<boolean> {
 async function report($: $, outcome: Outcome): Promise<string | null> {
   const shouldSay = await tell($, outcome)
   if (outcome.kind === 'not-installed' && !shouldSay) return null
-  toldProjectPath = linkedRoot(outcome) ?? toldProjectPath
+  const linked = linkedRoot(outcome)
+  if (linked) toldProjectPath.set('main', linked)
   return contextFor(outcome)
 }
 
@@ -400,16 +448,16 @@ function withContext<R extends { additionalContext?: string[] }>(result: R, text
 }
 
 /** After a move: say what to pass now, or to stop passing the old worktree. */
-async function reportMove($: $, dir: string): Promise<string | null> {
-  const before = toldProjectPath
+async function reportMove($: $, dir: string, loop: string): Promise<string | null> {
+  const before = toldProjectPath.get(loop) ?? null
   const outcome = await ensureWithin($, dir, START_BUDGET_MS)
   await tell($, outcome)
   const linked = linkedRoot(outcome)
   if (linked) {
-    toldProjectPath = linked
+    toldProjectPath.set(loop, linked)
     return contextFor(outcome)
   }
-  toldProjectPath = null
+  toldProjectPath.delete(loop)
   return movedContext(outcome, before)
 }
 
@@ -436,7 +484,8 @@ export const register: Register = (on, options) => {
       e.tool_name === 'EnterWorktree' && typeof response?.worktreePath === 'string'
         ? response.worktreePath
         : await $.session.cwd().catch(() => e.cwd)
-    return withContext(result, await reportMove($, dir))
+    const loop = typeof (e as { agent_id?: unknown }).agent_id === 'string' ? (e as { agent_id: string }).agent_id : 'main'
+    return withContext(result, await reportMove($, dir, loop))
   }).catch(passThrough)
 
   // /cd, a host's directory change: this event cannot carry context, so what
@@ -444,7 +493,7 @@ export const register: Register = (on, options) => {
   on('classic.CwdChanged', async ($, e, next) => {
     const result = await next(e)
     // Bounded by the same budget as the other hooks; the work runs on after it.
-    noteForNextPrompt = await reportMove($, e.new_cwd).catch(() => null)
+    noteForNextPrompt = await reportMove($, e.new_cwd, 'main').catch(() => null)
     return result
   }).catch(passThrough)
 
@@ -459,7 +508,7 @@ export const register: Register = (on, options) => {
   // session's. Its context does not carry the session start's, so say it again.
   on('classic.SubagentStart', async ($, e, next) => {
     const result = await next(e)
-    const outcome = await ensureWithin($, e.cwd, START_BUDGET_MS)
+    const outcome = await ensureWithin($, e.cwd, START_BUDGET_MS, e.agent_id)
     if (!linkedRoot(outcome)) return result
     void tell($, outcome).catch(() => undefined)
     return withContext(result, contextFor(outcome))

@@ -371,3 +371,42 @@ test('an empty destination folder is used, not replaced', () => {
     t.cleanup()
   }
 })
+
+test('probe: state, writer and an unreadable database', () => {
+  const t = tree()
+  const db = makeIndex(t.srcIndex)
+  try {
+    assert.deepEqual(
+      (({ status, state, writing }) => ({ status, state, writing }))(runWith(['--probe', t.srcIndex]).report),
+      { status: 'probed', state: 'complete', writing: false },
+    )
+    fs.writeFileSync(path.join(t.srcIndex, 'codegraph.lock'), String(process.pid))
+    assert.equal(runWith(['--probe', t.srcIndex]).report.writing, true)
+    const bad = path.join(t.base, 'bad')
+    fs.mkdirSync(bad)
+    fs.writeFileSync(path.join(bad, 'codegraph.db'), Buffer.alloc(8192, 7))
+    assert.equal(runWith(['--probe', bad]).report.broken, true)
+  } finally {
+    db.close()
+    t.cleanup()
+  }
+})
+
+test('the temp folder hides itself from git whole while the copy is made', () => {
+  // The script gives its temp folder a .gitignore of a bare `*` before anything
+  // else; git then shows nothing of the folder, the .gitignore included. (The
+  // usual `*` plus `!.gitignore` would show the folder.)
+  assert.match(fs.readFileSync(SCRIPT, 'utf8'), /writeFileSync\(path\.join\(tmp, GITIGNORE\), '\*\\n'\)/)
+  const t = tree()
+  try {
+    spawnSync('git', ['init', '-q', t.dst])
+    const tmp = path.join(t.dst, '.codegraph.cgwt-tmp-1-ab')
+    fs.mkdirSync(tmp)
+    fs.writeFileSync(path.join(tmp, '.gitignore'), '*\n')
+    fs.writeFileSync(path.join(tmp, 'codegraph.db'), 'x')
+    const st = spawnSync('git', ['-C', t.dst, 'status', '--porcelain'], { encoding: 'utf8' })
+    assert.equal(st.stdout.trim(), '')
+  } finally {
+    t.cleanup()
+  }
+})
