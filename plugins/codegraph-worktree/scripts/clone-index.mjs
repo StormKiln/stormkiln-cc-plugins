@@ -1,25 +1,32 @@
 #!/usr/bin/env node
-// Copies a CodeGraph index (.codegraph/) from one git working tree into
-// another, copy-on-write where the file system can, and only ever into a
-// destination that has no .codegraph/ yet.
+// Copies a CodeGraph index from one git working tree into another,
+// copy-on-write where the file system can, and only ever into a destination
+// that holds no index yet.
 //
-//   node clone-index.mjs <source .codegraph dir> <destination worktree root>
+//   node clone-index.mjs <source index dir> <destination worktree root> [index dir name] [scratch dir]
 //
-// Prints one JSON line on stdout: { status, method?, ms?, reason? }
-//   status "copied"   the index is in place at <root>/.codegraph
-//   status "exists"   <root>/.codegraph was already there (or another process
-//                     placed it first); nothing was touched
+// The index dir name is `.codegraph` unless CODEGRAPH_DIR names another. The
+// scratch dir (the worktree's own git dir) is where the copy is built when it
+// is on the same device as the destination, so a crash never leaves anything
+// git would show; otherwise it is built beside the destination.
+//
+// Prints one JSON line on stdout: { status, method?, checked?, reason?, ms }
+//   status "copied"   the index is in place at <root>/<index dir name>
+//   status "exists"   the destination already held an index (or another
+//                     process placed one first); nothing was touched
 //   status "skipped"  the source cannot be copied safely right now (a rebuild
-//                     is running, or it never settled); nothing was written
+//                     is running, or it kept changing); nothing was written
 //   status "failed"   something went wrong; anything this run wrote is removed
 //
 // Safety rules this script keeps:
-//   - it writes only inside a temporary folder it created itself, then renames
-//     that folder to <root>/.codegraph in one step; rename never replaces a
-//     non-empty folder, so an existing index is never overwritten
+//   - it writes only inside a temporary folder it created itself, and places
+//     the result in one atomic step that never replaces anything: a rename of
+//     the whole folder when the destination is absent, or a hard link of the
+//     database when the destination holds only a committed .gitignore
+//   - the source is only ever read; nothing it writes is in the source folder
 //   - it never deletes anything it did not create (stale temporaries of its
 //     own name pattern, older than an hour, are the one exception)
-//   - the copy is checked by SQLite before it is placed
+//   - the copy is checked by SQLite, and folded into one file, before it is placed
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -32,16 +39,36 @@ const STALE_TMP_MS = 60 * 60 * 1000
 // the WAL; pid, socket, lock and log files belong to the source's processes.
 const DB = 'codegraph.db'
 const WAL = 'codegraph.db-wal'
+const SHM = 'codegraph.db-shm'
 const GITIGNORE = '.gitignore'
 const SYNC_MARKER = 'cgwt-sync'
 const DEFAULT_GITIGNORE =
   '# CodeGraph data files: local to each machine, not for committing.\n*\n!.gitignore\n'
 const MAX_ATTEMPTS = 5
+// Files a destination folder may hold and still take a copy: a committed .gitignore.
+const EMPTY_ENOUGH = new Set([GITIGNORE])
+const IS_WIN = process.platform === 'win32'
 
 const started = Date.now()
 
 function out(result) {
   process.stdout.write(`${JSON.stringify({ ...result, ms: Date.now() - started })}\n`)
+}
+
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+
+// Windows refuses a rename or removal while anything (an antivirus scan, the
+// search indexer) holds a file inside; it lets go within seconds.
+function retryBusy(fn) {
+  const until = Date.now() + (IS_WIN ? 10_000 : 0)
+  for (let wait = 50; ; wait = Math.min(wait * 2, 1000)) {
+    try {
+      return fn()
+    } catch (err) {
+      if (!IS_WIN || !['EPERM', 'EACCES', 'EBUSY'].includes(err.code) || Date.now() > until) throw err
+      sleepSync(wait)
+    }
+  }
 }
 
 function fileId(p) {
@@ -78,10 +105,26 @@ function rebuildRunning(srcDir) {
   return isAlive(Number(match[0]))
 }
 
+// Whether `dir` is on an APFS volume: `cp -c` clones there and silently
+// copies every byte anywhere else (exFAT, HFS+, SMB).
+function isApfs(dir) {
+  const df = spawnSync('/bin/df', ['-P', dir], { encoding: 'utf8', timeout: 5_000 })
+  const line = df.status === 0 ? df.stdout.trim().split('\n').pop() : ''
+  // Filesystem 512-blocks Used Available Capacity Mounted-on (which may hold spaces)
+  const mountPoint = line?.split(/\s+/).slice(5).join(' ')
+  if (!mountPoint) return false
+  const mount = spawnSync('/sbin/mount', [], { encoding: 'utf8', timeout: 5_000 })
+  if (mount.status !== 0) return false
+  const entry = mount.stdout.split('\n').find((l) => l.includes(` on ${mountPoint} (`))
+  return /\(apfs[,)]/.test(entry ?? '')
+}
+
 // clonefile(2) through the system cp: Node's own COPYFILE_FICLONE does not
 // clone on macOS (libuv answers ENOSYS to the forced form and copies bytes
-// for the other). `cp -c` fails rather than copying when it cannot clone.
-function cloneDarwin(src, dst) {
+// for the other).
+function cloneDarwin(src, dst, state) {
+  state.apfs ??= isApfs(path.dirname(dst))
+  if (!state.apfs) throw Object.assign(new Error('not an APFS volume'), { code: 'ENOTSUP' })
   if (fs.existsSync(dst)) throw Object.assign(new Error(`exists: ${dst}`), { code: 'EEXIST' })
   const r = spawnSync('/bin/cp', ['-c', src, dst], { stdio: 'ignore', timeout: 60_000 })
   if (r.status !== 0) {
@@ -95,7 +138,7 @@ function cloneDarwin(src, dst) {
 function copyFile(src, dst, state) {
   if (state.method !== 'copy') {
     try {
-      if (process.platform === 'darwin') cloneDarwin(src, dst)
+      if (process.platform === 'darwin') cloneDarwin(src, dst, state)
       else fs.copyFileSync(src, dst, fs.constants.COPYFILE_EXCL | fs.constants.COPYFILE_FICLONE_FORCE)
       state.method = 'clone'
       return
@@ -123,21 +166,25 @@ function freeBytes(dir) {
 }
 
 function removeOwnTmp(tmp) {
-  // Only ever a folder this run created, by its exact name.
+  // Only ever a folder this run created, by its exact name pattern.
   if (!tmp || !path.basename(tmp).startsWith(TMP_PREFIX)) return
-  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 3 })
+  try {
+    retryBusy(() => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 3 }))
+  } catch {
+    // Swept by a later run once stale.
+  }
 }
 
-function sweepStaleTmp(root) {
+function sweepStaleTmp(dir) {
   let entries
   try {
-    entries = fs.readdirSync(root, { withFileTypes: true })
+    entries = fs.readdirSync(dir, { withFileTypes: true })
   } catch {
     return
   }
   for (const e of entries) {
     if (!e.isDirectory() || !e.name.startsWith(TMP_PREFIX)) continue
-    const p = path.join(root, e.name)
+    const p = path.join(dir, e.name)
     try {
       if (Date.now() - fs.statSync(p).mtimeMs > STALE_TMP_MS) removeOwnTmp(p)
     } catch {
@@ -166,43 +213,114 @@ async function verify(dbPath) {
     for (const t of ['files', 'nodes', 'edges']) {
       if (!tables.has(t)) throw new Error(`not a CodeGraph index: no ${t} table`)
     }
-    // Fold the WAL into the database so the placed copy is one file and the
-    // first reader does not need to replay it.
-    db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    // Fold the WAL into the database, so the copy placed is one file.
+    const [cp] = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').all()
+    if (cp && Object.values(cp)[0] !== 0) throw new Error('could not fold the WAL into the copy')
   } finally {
     db.close()
   }
   return { checked: true }
 }
 
+/** Where to build the copy: the scratch dir when it shares the destination's device. */
+function tmpParent(root, scratch) {
+  if (!scratch) return root
+  try {
+    if (fs.statSync(scratch).isDirectory() && fs.statSync(scratch).dev === fs.statSync(root).dev) return scratch
+  } catch {
+    // Fall back to the destination's own folder.
+  }
+  return root
+}
+
+/** What the destination folder holds: absent, empty enough to take a copy, or taken. */
+function destState(dest) {
+  let names
+  try {
+    names = fs.readdirSync(dest)
+  } catch (err) {
+    if (err.code === 'ENOENT') return 'absent'
+    throw err
+  }
+  return names.every((n) => EMPTY_ENOUGH.has(n)) ? 'empty' : 'taken'
+}
+
+/**
+ * Places the built folder at `dest` without ever replacing anything. Returns
+ * false when another process got there first.
+ */
+function place(tmp, dest) {
+  if (destState(dest) === 'absent') {
+    try {
+      retryBusy(() => fs.renameSync(tmp, dest))
+      return true
+    } catch (err) {
+      // POSIX rename replaces an empty folder; a non-empty one fails, as does
+      // any existing one on Windows. Either way the folder is there now.
+      if (!fs.existsSync(dest)) throw err
+    }
+  }
+  if (destState(dest) !== 'empty') return false
+  // A folder with only a committed .gitignore: keep it, add the index files.
+  // The marker first, then the database by hard link, which fails rather
+  // than replace a database another process placed meanwhile.
+  try {
+    fs.copyFileSync(path.join(tmp, SYNC_MARKER), path.join(dest, SYNC_MARKER), fs.constants.COPYFILE_EXCL)
+  } catch (err) {
+    if (err.code !== 'EEXIST') throw err
+  }
+  // A WAL is left only where SQLite could not fold it in; it goes first, so
+  // the database is never seen without it.
+  for (const f of fs.existsSync(path.join(tmp, WAL)) ? [WAL, DB] : [DB]) {
+    try {
+      fs.linkSync(path.join(tmp, f), path.join(dest, f))
+    } catch (err) {
+      if (err.code === 'EEXIST') return false
+      // A file system without hard links: rename, after one more look.
+      if (fs.existsSync(path.join(dest, DB)) || fs.existsSync(path.join(dest, f))) return false
+      retryBusy(() => fs.renameSync(path.join(tmp, f), path.join(dest, f)))
+    }
+  }
+  return true
+}
+
 async function main() {
-  const [srcArg, rootArg] = process.argv.slice(2)
+  const [srcArg, rootArg, nameArg = '.codegraph', scratchArg] = process.argv.slice(2)
   if (!srcArg || !rootArg) {
-    out({ status: 'failed', reason: 'usage: clone-index.mjs <source .codegraph dir> <destination root>' })
+    out({ status: 'failed', reason: 'usage: clone-index.mjs <source index dir> <destination root> [index dir name] [scratch dir]' })
+    process.exitCode = 2
+    return
+  }
+  if (nameArg === '.' || nameArg.includes('..') || /[\\/]/.test(nameArg) || path.isAbsolute(nameArg)) {
+    out({ status: 'failed', reason: `not a plain folder name: ${nameArg}` })
     process.exitCode = 2
     return
   }
   const srcDir = path.resolve(srcArg)
   const root = path.resolve(rootArg)
-  const dest = path.join(root, '.codegraph')
+  const dest = path.join(root, nameArg)
   const srcDb = path.join(srcDir, DB)
   const srcWal = path.join(srcDir, WAL)
 
   if (!fs.statSync(root).isDirectory()) throw new Error(`not a directory: ${root}`)
-  if (fs.existsSync(dest)) return out({ status: 'exists' })
-  if (path.resolve(path.dirname(srcDir)) === root) {
+  if (destState(dest) === 'taken') return out({ status: 'exists' })
+  // The source index sitting in the destination tree itself (a symlink, a
+  // repeated path): never copy a tree onto itself.
+  if (path.dirname(fs.realpathSync(srcDir)) === fs.realpathSync(root)) {
     return out({ status: 'failed', reason: 'source and destination are the same tree' })
   }
   const srcStat = fs.statSync(srcDb)
   if (!srcStat.isFile()) throw new Error(`source index is not a file: ${srcDb}`)
   if (rebuildRunning(srcDir)) return out({ status: 'skipped', reason: 'a rebuild of the source index is running' })
 
-  sweepStaleTmp(root)
+  const parent = tmpParent(root, scratchArg ? path.resolve(scratchArg) : undefined)
+  sweepStaleTmp(parent)
+  if (parent !== root) sweepStaleTmp(root)
 
-  const tmp = path.join(root, `${TMP_PREFIX}${process.pid}-${crypto.randomBytes(4).toString('hex')}`)
+  const tmp = path.join(parent, `${TMP_PREFIX}${process.pid}-${crypto.randomBytes(4).toString('hex')}`)
   fs.mkdirSync(tmp)
   try {
-    const state = { method: undefined }
+    const state = { method: undefined, apfs: undefined }
     let settled = false
     for (let attempt = 0; attempt < MAX_ATTEMPTS && !settled; attempt++) {
       if (attempt > 0) {
@@ -237,19 +355,13 @@ async function main() {
     fs.writeFileSync(path.join(tmp, SYNC_MARKER), 'pending\n')
 
     const { checked } = await verify(path.join(tmp, DB))
-    // The -shm SQLite made while checking belongs to the folder's old name.
-    fs.rmSync(path.join(tmp, `${DB}-shm`), { force: true })
+    // Folded into the database: what is left of the WAL, and the -shm SQLite
+    // made while checking, belong to this folder alone.
+    if (checked) for (const f of [WAL, SHM]) fs.rmSync(path.join(tmp, f), { force: true })
 
-    try {
-      fs.renameSync(tmp, dest)
-    } catch (err) {
-      removeOwnTmp(tmp)
-      if (['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES', 'EISDIR'].includes(err.code) && fs.existsSync(dest)) {
-        return out({ status: 'exists' })
-      }
-      throw err
-    }
-    out({ status: 'copied', method: state.method, checked })
+    const placed = place(tmp, dest)
+    removeOwnTmp(tmp)
+    out(placed ? { status: 'copied', method: state.method, checked } : { status: 'exists' })
   } catch (err) {
     removeOwnTmp(tmp)
     throw err

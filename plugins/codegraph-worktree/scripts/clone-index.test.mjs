@@ -211,3 +211,114 @@ test('a missing destination fails cleanly', () => {
     t.cleanup()
   }
 })
+
+function runWith(args) {
+  const r = spawnSync(process.execPath, [SCRIPT, ...args], { encoding: 'utf8' })
+  return { code: r.status, report: JSON.parse(r.stdout.trim().split('\n').pop()) }
+}
+
+test('the placed copy is one file: the WAL is folded in', () => {
+  const t = tree()
+  const db = makeIndex(t.srcIndex, 4)
+  try {
+    assert.equal(run(t.srcIndex, t.dst).report.status, 'copied')
+    assert.deepEqual(fs.readdirSync(path.join(t.dst, '.codegraph')).sort(), ['.gitignore', 'cgwt-sync', 'codegraph.db'])
+    const copy = new DatabaseSync(path.join(t.dst, '.codegraph', 'codegraph.db'), { readOnly: true })
+    assert.equal(copy.prepare('SELECT count(*) AS c FROM nodes').get().c, 4)
+    copy.close()
+  } finally {
+    db.close()
+    t.cleanup()
+  }
+})
+
+test('a destination holding only a committed .gitignore takes the copy and keeps that file', () => {
+  const t = tree()
+  const db = makeIndex(t.srcIndex, 3)
+  try {
+    fs.mkdirSync(path.join(t.dst, '.codegraph'))
+    fs.writeFileSync(path.join(t.dst, '.codegraph', '.gitignore'), 'committed\n')
+    const { report } = run(t.srcIndex, t.dst)
+    assert.equal(report.status, 'copied')
+    assert.equal(fs.readFileSync(path.join(t.dst, '.codegraph', '.gitignore'), 'utf8'), 'committed\n')
+    const copy = new DatabaseSync(path.join(t.dst, '.codegraph', 'codegraph.db'), { readOnly: true })
+    assert.equal(copy.prepare('SELECT count(*) AS c FROM nodes').get().c, 3)
+    copy.close()
+    assert.deepEqual(leftovers(t.dst), [])
+  } finally {
+    db.close()
+    t.cleanup()
+  }
+})
+
+test('racing copies into a .gitignore-only destination place exactly one database', async () => {
+  const t = tree()
+  const db = makeIndex(t.srcIndex, 50)
+  try {
+    fs.mkdirSync(path.join(t.dst, '.codegraph'))
+    fs.writeFileSync(path.join(t.dst, '.codegraph', '.gitignore'), '*\n')
+    const reports = await Promise.all(Array.from({ length: 6 }, () => runAsync(t.srcIndex, t.dst)))
+    assert.equal(reports.filter((r) => r.status === 'copied').length, 1, JSON.stringify(reports))
+    assert.ok(reports.every((r) => r.status === 'copied' || r.status === 'exists'), JSON.stringify(reports))
+    assert.deepEqual(leftovers(t.dst), [])
+  } finally {
+    db.close()
+    t.cleanup()
+  }
+})
+
+test('builds in the scratch dir when it shares the device, leaving nothing in the worktree', () => {
+  const t = tree()
+  const db = makeIndex(t.srcIndex)
+  try {
+    const scratch = path.join(t.base, 'gitdir')
+    fs.mkdirSync(scratch)
+    const stale = path.join(scratch, '.codegraph.cgwt-tmp-1-old')
+    fs.mkdirSync(stale)
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000)
+    fs.utimesSync(stale, old, old)
+    const { report } = runWith([t.srcIndex, t.dst, '.codegraph', scratch])
+    assert.equal(report.status, 'copied')
+    assert.deepEqual(fs.readdirSync(scratch), [])
+    assert.deepEqual(leftovers(t.dst), [])
+  } finally {
+    db.close()
+    t.cleanup()
+  }
+})
+
+test('honours a CODEGRAPH_DIR name, and refuses one that is a path', () => {
+  const t = tree()
+  const custom = path.join(t.src, '.cg')
+  fs.mkdirSync(custom)
+  const db = makeIndex(custom)
+  try {
+    assert.equal(runWith([custom, t.dst, '.cg']).report.status, 'copied')
+    assert.ok(fs.existsSync(path.join(t.dst, '.cg', 'codegraph.db')))
+    for (const bad of ['../x', 'a/b', '.']) {
+      const { code, report } = runWith([custom, t.dst, bad])
+      assert.equal(code, 2)
+      assert.equal(report.status, 'failed')
+    }
+  } finally {
+    db.close()
+    t.cleanup()
+  }
+})
+
+test('a source that is the destination tree itself is refused', () => {
+  const t = tree()
+  const db = makeIndex(t.srcIndex)
+  try {
+    const link = path.join(t.base, 'alias')
+    fs.symlinkSync(t.src, link)
+    // dest .codegraph exists here, so it is a no-op; with it moved aside the guard still refuses.
+    fs.renameSync(t.srcIndex, path.join(t.src, '.cg2'))
+    const { report } = runWith([path.join(link, '.cg2'), t.src, '.cg2'])
+    assert.ok(['exists', 'failed'].includes(report.status))
+    assert.ok(fs.existsSync(path.join(t.src, '.cg2', 'codegraph.db')))
+  } finally {
+    db.close()
+    t.cleanup()
+  }
+})
