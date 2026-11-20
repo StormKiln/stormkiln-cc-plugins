@@ -267,9 +267,12 @@ export function unsafeRootReason(root: string, home: string | undefined, platfor
   return null
 }
 
-/** Entries an index folder may hold before it holds an index: a committed `.gitignore`. */
+/**
+ * Entries an index folder may hold before it holds an index: a committed
+ * `.gitignore`, and the marker a copy that was cut short left.
+ */
 export function isEmptyIndexDir(names: readonly string[]): boolean {
-  return names.every((n) => n === '.gitignore')
+  return names.every((n) => n === '.gitignore' || n === 'cgwt-sync')
 }
 
 /** The clone script's one JSON line. */

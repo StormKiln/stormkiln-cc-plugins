@@ -20,9 +20,11 @@
 //
 // Safety rules this script keeps:
 //   - it writes only inside a temporary folder it created itself, and places
-//     the result in one atomic step that never replaces anything: a rename of
-//     the whole folder when the destination is absent, or a hard link of the
-//     database when the destination holds only a committed .gitignore
+//     the database in one atomic step that never replaces anything (a hard
+//     link, or a rename where the file system has no hard links), into a
+//     destination folder that is absent or holds only a committed .gitignore
+//   - it copies nothing while CodeGraph is writing the source, and nothing
+//     but a finished index
 //   - the source is only ever read; nothing it writes is in the source folder
 //   - it never deletes anything it did not create (stale temporaries of its
 //     own name pattern, older than an hour, are the one exception)
@@ -46,7 +48,8 @@ const DEFAULT_GITIGNORE =
   '# CodeGraph data files: local to each machine, not for committing.\n*\n!.gitignore\n'
 const MAX_ATTEMPTS = 5
 // Files a destination folder may hold and still take a copy: a committed .gitignore.
-const EMPTY_ENOUGH = new Set([GITIGNORE])
+// Our own marker too: a run killed after writing it must not block the next.
+const EMPTY_ENOUGH = new Set([GITIGNORE, SYNC_MARKER])
 const IS_WIN = process.platform === 'win32'
 
 const started = Date.now()
@@ -71,15 +74,35 @@ function retryBusy(fn) {
   }
 }
 
-function fileId(p) {
+// What a file is right now: its inode, size and mtime, plus the header bytes
+// SQLite changes on every commit and checkpoint (the database's change
+// counter, the WAL's checkpoint sequence and salts), so a write the clock is
+// too coarse to see still shows.
+function fileId(p, headerBytes) {
+  let s
   try {
-    const s = fs.statSync(p, { bigint: true })
-    return `${s.ino}:${s.size}:${s.mtimeNs}`
+    s = fs.statSync(p, { bigint: true })
   } catch (err) {
     if (err.code === 'ENOENT') return 'absent'
     throw err
   }
+  let header = ''
+  try {
+    const fd = fs.openSync(p, 'r')
+    try {
+      const buf = Buffer.alloc(headerBytes)
+      const n = fs.readSync(fd, buf, 0, headerBytes, 0)
+      header = buf.subarray(0, n).toString('hex')
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    // The stat alone, then.
+  }
+  return `${s.ino}:${s.size}:${s.mtimeNs}:${header}`
 }
+const dbId = (p) => fileId(p, 100)
+const walId = (p) => fileId(p, 32)
 
 function isAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false
@@ -91,18 +114,24 @@ function isAlive(pid) {
   }
 }
 
-// `codegraph index` holds rebuild.pid while it rewrites the database from
-// scratch; a copy taken then is a half-built index.
-function rebuildRunning(srcDir) {
+function heldByLiveProcess(file) {
   let text
   try {
-    text = fs.readFileSync(path.join(srcDir, 'rebuild.pid'), 'utf8')
+    text = fs.readFileSync(file, 'utf8')
   } catch {
     return false
   }
   const match = /\d+/.exec(text)
-  if (!match) return false
-  return isAlive(Number(match[0]))
+  return match !== null && isAlive(Number(match[0]))
+}
+
+// `codegraph index` holds rebuild.pid while it rewrites the database from
+// scratch; `codegraph init` and `sync` hold codegraph.lock while they index,
+// init without a journal on disk. A copy taken then is a half-built index.
+function indexingRunning(srcDir) {
+  if (heldByLiveProcess(path.join(srcDir, 'rebuild.pid'))) return 'a rebuild of the source index is running'
+  if (heldByLiveProcess(path.join(srcDir, 'codegraph.lock'))) return 'the source index is being written (codegraph.lock is held)'
+  return null
 }
 
 // Whether `dir` is on an APFS volume: `cp -c` clones there and silently
@@ -213,6 +242,14 @@ async function verify(dbPath) {
     for (const t of ['files', 'nodes', 'edges']) {
       if (!tables.has(t)) throw new Error(`not a CodeGraph index: no ${t} table`)
     }
+    // Only a finished index is worth copying: a sync later marks a half-built
+    // one complete without redoing what its run never reached.
+    if (tables.has('project_metadata')) {
+      const row = db.prepare("SELECT value FROM project_metadata WHERE key = 'index_state'").get()
+      if (row && row.value !== 'complete') {
+        throw Object.assign(new Error(`the source index is ${row.value}, not complete`), { skip: true })
+      }
+    }
     // Fold the WAL into the database, so the copy placed is one file.
     const [cp] = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').all()
     if (cp && Object.values(cp)[0] !== 0) throw new Error('could not fold the WAL into the copy')
@@ -246,42 +283,49 @@ function destState(dest) {
 }
 
 /**
- * Places the built folder at `dest` without ever replacing anything. Returns
- * false when another process got there first.
+ * Places the built index at `dest` without ever replacing anything; false
+ * when another process got there first. The folder is made with mkdir, which
+ * fails rather than take over a folder someone else just made; the database
+ * then goes in by hard link, which fails rather than replace one. Until that
+ * link, everything in the folder is a file that leaves it "empty enough" for
+ * the next run, so a kill at any point never blocks a later copy.
  */
 function place(tmp, dest) {
-  if (destState(dest) === 'absent') {
-    try {
-      retryBusy(() => fs.renameSync(tmp, dest))
-      return true
-    } catch (err) {
-      // POSIX rename replaces an empty folder; a non-empty one fails, as does
-      // any existing one on Windows. Either way the folder is there now.
-      if (!fs.existsSync(dest)) throw err
-    }
-  }
-  if (destState(dest) !== 'empty') return false
-  // A folder with only a committed .gitignore: keep it, add the index files.
-  // The marker first, then the database by hard link, which fails rather
-  // than replace a database another process placed meanwhile.
   try {
-    fs.copyFileSync(path.join(tmp, SYNC_MARKER), path.join(dest, SYNC_MARKER), fs.constants.COPYFILE_EXCL)
+    fs.mkdirSync(dest)
   } catch (err) {
     if (err.code !== 'EEXIST') throw err
   }
-  // A WAL is left only where SQLite could not fold it in; it goes first, so
-  // the database is never seen without it.
-  for (const f of fs.existsSync(path.join(tmp, WAL)) ? [WAL, DB] : [DB]) {
+  if (destState(dest) !== 'empty') return false
+  const made = []
+  const putIfAbsent = (name) => {
     try {
-      fs.linkSync(path.join(tmp, f), path.join(dest, f))
+      fs.copyFileSync(path.join(tmp, name), path.join(dest, name), fs.constants.COPYFILE_EXCL)
+      made.push(name)
     } catch (err) {
-      if (err.code === 'EEXIST') return false
-      // A file system without hard links: rename, after one more look.
-      if (fs.existsSync(path.join(dest, DB)) || fs.existsSync(path.join(dest, f))) return false
-      retryBusy(() => fs.renameSync(path.join(tmp, f), path.join(dest, f)))
+      if (err.code !== 'EEXIST') throw err
     }
   }
-  return true
+  putIfAbsent(GITIGNORE)
+  putIfAbsent(SYNC_MARKER)
+  const target = path.join(dest, DB)
+  try {
+    fs.linkSync(path.join(tmp, DB), target)
+    return true
+  } catch (err) {
+    if (err.code !== 'EEXIST') {
+      // A file system without hard links (exFAT, some network shares):
+      // rename, after one more look.
+      if (!fs.existsSync(target) && !fs.existsSync(path.join(dest, WAL))) {
+        retryBusy(() => fs.renameSync(path.join(tmp, DB), target))
+        return true
+      }
+    }
+    // Lost the race: take back the marker this run added, so the folder is
+    // as the winner left it (a .gitignore the winner would write the same).
+    if (made.includes(SYNC_MARKER)) fs.rmSync(path.join(dest, SYNC_MARKER), { force: true })
+    return false
+  }
 }
 
 async function main() {
@@ -311,7 +355,8 @@ async function main() {
   }
   const srcStat = fs.statSync(srcDb)
   if (!srcStat.isFile()) throw new Error(`source index is not a file: ${srcDb}`)
-  if (rebuildRunning(srcDir)) return out({ status: 'skipped', reason: 'a rebuild of the source index is running' })
+  const busy = indexingRunning(srcDir)
+  if (busy) return out({ status: 'skipped', reason: busy })
 
   const parent = tmpParent(root, scratchArg ? path.resolve(scratchArg) : undefined)
   sweepStaleTmp(parent)
@@ -320,6 +365,12 @@ async function main() {
   const tmp = path.join(parent, `${TMP_PREFIX}${process.pid}-${crypto.randomBytes(4).toString('hex')}`)
   fs.mkdirSync(tmp)
   try {
+    // First, so git never shows the copy while it is being made, even when
+    // it is made beside the worktree's files.
+    const srcIgnore = path.join(srcDir, GITIGNORE)
+    if (fs.existsSync(srcIgnore)) fs.copyFileSync(srcIgnore, path.join(tmp, GITIGNORE))
+    else fs.writeFileSync(path.join(tmp, GITIGNORE), DEFAULT_GITIGNORE)
+
     const state = { method: undefined, apfs: undefined }
     let settled = false
     for (let attempt = 0; attempt < MAX_ATTEMPTS && !settled; attempt++) {
@@ -327,7 +378,7 @@ async function main() {
         for (const f of [DB, WAL]) fs.rmSync(path.join(tmp, f), { force: true })
         await new Promise((r) => setTimeout(r, 150 * attempt))
       }
-      const before = [fileId(srcDb), fileId(srcWal)]
+      const before = [dbId(srcDb), walId(srcWal)]
       // WAL first: a checkpoint between the two copies then only moves pages
       // the copied WAL already holds into the copied database.
       if (before[1] !== 'absent') {
@@ -338,7 +389,7 @@ async function main() {
         }
       }
       copyFile(srcDb, path.join(tmp, DB), state)
-      const after = [fileId(srcDb), fileId(srcWal)]
+      const after = [dbId(srcDb), walId(srcWal)]
       settled = before[0] === after[0] && before[1] === after[1]
     }
     if (!settled) {
@@ -346,18 +397,29 @@ async function main() {
       return out({ status: 'skipped', reason: 'the source index kept changing while it was copied' })
     }
 
-    const srcIgnore = path.join(srcDir, GITIGNORE)
-    if (fs.existsSync(srcIgnore)) fs.copyFileSync(srcIgnore, path.join(tmp, GITIGNORE))
-    else fs.writeFileSync(path.join(tmp, GITIGNORE), DEFAULT_GITIGNORE)
-
     // Until `codegraph sync` has run here, the index describes the source
     // tree's branch; the mod reads this to finish the sync in a later session.
     fs.writeFileSync(path.join(tmp, SYNC_MARKER), 'pending\n')
 
-    const { checked } = await verify(path.join(tmp, DB))
+    let checked
+    try {
+      ;({ checked } = await verify(path.join(tmp, DB)))
+    } catch (err) {
+      if (err.skip) {
+        removeOwnTmp(tmp)
+        return out({ status: 'skipped', reason: err.message })
+      }
+      throw err
+    }
+    // Without SQLite to fold the WAL in, the copy cannot be placed as one
+    // file, and a WAL set beside a database it does not belong to corrupts it.
+    if (!checked && fs.existsSync(path.join(tmp, WAL)) && fs.statSync(path.join(tmp, WAL)).size > 0) {
+      removeOwnTmp(tmp)
+      return out({ status: 'failed', reason: 'node:sqlite is unavailable to fold the WAL into the copy' })
+    }
     // Folded into the database: what is left of the WAL, and the -shm SQLite
     // made while checking, belong to this folder alone.
-    if (checked) for (const f of [WAL, SHM]) fs.rmSync(path.join(tmp, f), { force: true })
+    for (const f of [WAL, SHM]) fs.rmSync(path.join(tmp, f), { force: true })
 
     const placed = place(tmp, dest)
     removeOwnTmp(tmp)

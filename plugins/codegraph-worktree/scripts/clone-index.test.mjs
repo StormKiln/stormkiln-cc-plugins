@@ -24,6 +24,7 @@ function makeIndex(dir, rows = 3) {
   const db = new DatabaseSync(path.join(dir, 'codegraph.db'))
   db.exec('PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0')
   db.exec('CREATE TABLE files (path TEXT PRIMARY KEY); CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT); CREATE TABLE edges (a INTEGER, b INTEGER)')
+  db.exec("CREATE TABLE project_metadata (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); INSERT INTO project_metadata VALUES ('index_state', 'complete', 0)")
   const ins = db.prepare('INSERT INTO nodes (name) VALUES (?)')
   for (let i = 0; i < rows; i++) ins.run(`n${i}`)
   fs.writeFileSync(path.join(dir, '.gitignore'), '*\n!.gitignore\n')
@@ -317,6 +318,54 @@ test('a source that is the destination tree itself is refused', () => {
     const { report } = runWith([path.join(link, '.cg2'), t.src, '.cg2'])
     assert.ok(['exists', 'failed'].includes(report.status))
     assert.ok(fs.existsSync(path.join(t.src, '.cg2', 'codegraph.db')))
+  } finally {
+    db.close()
+    t.cleanup()
+  }
+})
+
+test('copies nothing while CodeGraph holds the source lock, or from an unfinished index', () => {
+  const t = tree()
+  const db = makeIndex(t.srcIndex)
+  try {
+    fs.writeFileSync(path.join(t.srcIndex, 'codegraph.lock'), String(process.pid))
+    assert.equal(run(t.srcIndex, t.dst).report.status, 'skipped')
+    fs.writeFileSync(path.join(t.srcIndex, 'codegraph.lock'), '999999999')
+    db.exec("UPDATE project_metadata SET value = 'indexing' WHERE key = 'index_state'")
+    const { report } = run(t.srcIndex, t.dst)
+    assert.equal(report.status, 'skipped')
+    assert.match(report.reason, /indexing/)
+    assert.ok(!fs.existsSync(path.join(t.dst, '.codegraph')))
+    assert.deepEqual(leftovers(t.dst), [])
+  } finally {
+    db.close()
+    t.cleanup()
+  }
+})
+
+test('a destination a killed run left with only .gitignore and the marker still takes a copy', () => {
+  const t = tree()
+  const db = makeIndex(t.srcIndex)
+  try {
+    fs.mkdirSync(path.join(t.dst, '.codegraph'))
+    fs.writeFileSync(path.join(t.dst, '.codegraph', '.gitignore'), '*\n')
+    fs.writeFileSync(path.join(t.dst, '.codegraph', 'cgwt-sync'), 'pending\n')
+    assert.equal(run(t.srcIndex, t.dst).report.status, 'copied')
+    assert.ok(fs.existsSync(path.join(t.dst, '.codegraph', 'codegraph.db')))
+  } finally {
+    db.close()
+    t.cleanup()
+  }
+})
+
+test('an empty destination folder is used, not replaced', () => {
+  const t = tree()
+  const db = makeIndex(t.srcIndex)
+  try {
+    fs.mkdirSync(path.join(t.dst, '.codegraph'))
+    const ino = fs.statSync(path.join(t.dst, '.codegraph')).ino
+    assert.equal(run(t.srcIndex, t.dst).report.status, 'copied')
+    assert.equal(fs.statSync(path.join(t.dst, '.codegraph')).ino, ino)
   } finally {
     db.close()
     t.cleanup()
