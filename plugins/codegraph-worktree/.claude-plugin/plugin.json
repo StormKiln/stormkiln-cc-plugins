@@ -1,0 +1,21 @@
+{
+  "name": "codegraph-worktree",
+  "version": "0.1.0",
+  "description": "Makes CodeGraph work in git worktrees: copies the index into a new worktree (copy-on-write where the file system can), indexes repositories that have none, and recommends installing CodeGraph when it is missing.",
+  "author": { "name": "StormKiln" },
+  "license": "MIT",
+  "userConfig": {
+    "copyIntoWorktrees": {
+      "type": "boolean",
+      "title": "Copy the index into worktrees",
+      "description": "When a git worktree has no CodeGraph index, copy one from the main working tree (or another worktree) and sync it to the worktree's branch.",
+      "default": true
+    },
+    "autoInit": {
+      "type": "boolean",
+      "title": "Index repositories that have none",
+      "description": "Run `codegraph init` in the background when the session's git repository has no index and none can be copied.",
+      "default": true
+    }
+  }
+}
