@@ -72,11 +72,28 @@ function debug($: $, text: string) {
   }
 }
 
+/**
+ * The host's OS, from what every Claude Code version has: Windows sets
+ * OS=Windows_NT; elsewhere `uname -s`, with WSL known by its own variables.
+ */
+async function detectPlatform($: $): Promise<Platform> {
+  if ((await $.env.get('OS')) === 'Windows_NT') return 'windows'
+  for (const uname of ['/usr/bin/uname', '/bin/uname']) {
+    const r = await $.process.run([uname, '-s'], { timeoutMs: 5_000 }).catch(() => undefined)
+    if (!r || r.exitCode !== 0) continue
+    const name = r.stdout.trim()
+    if (name === 'Darwin') return 'macos'
+    if (name === 'Linux') {
+      const wsl = (await $.env.get('WSL_DISTRO_NAME')) ?? (await $.env.get('WSL_INTEROP'))
+      return wsl ? 'wsl' : 'linux'
+    }
+    return 'unknown'
+  }
+  return 'unknown'
+}
+
 function platformOf($: $): Promise<Platform> {
-  return (platformOnce ??= $.session
-    .info()
-    .then((i) => (i.platform ?? 'unknown') as Platform)
-    .catch(() => 'unknown' as Platform))
+  return (platformOnce ??= detectPlatform($).catch(() => 'unknown' as Platform))
 }
 
 async function homeOf($: $): Promise<string | undefined> {

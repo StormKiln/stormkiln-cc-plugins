@@ -232,7 +232,6 @@ function host(on: On, opts: { installed?: boolean; worktreeIndexed?: boolean } =
   const toasts: string[] = []
   const store = new Map<string, unknown>()
 
-  on('session.info', () => ({ value: { platform: 'linux', transcriptPath: '' } as never }))
   let sessionCwd = '/r-wt'
   on('session.cwd', () => ({ value: sessionCwd }))
   on('fs.list', (_, e) => ({
@@ -257,6 +256,7 @@ function host(on: On, opts: { installed?: boolean; worktreeIndexed?: boolean } =
     const [cmd, ...args] = e.argv
     const done = (exitCode: number, stdout: string, stderr = '') => ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
     const ok = (stdout: string) => done(0, stdout)
+    if (cmd === '/usr/bin/uname') return ok('Linux\n')
     if (cmd === '/usr/bin/git' && args[0] === 'rev-parse') {
       if (e.init?.cwd === '/r') return ok('/r\n/r/.git\n.git\n')
       if (e.init?.cwd === '/r/src') return ok('/r\n/r/.git\n../.git\n')
@@ -343,7 +343,7 @@ describe('session start', () => {
     await settle()
     expect(h.spawns).toEqual([])
     expect(h.detached).toEqual([])
-    expect(h.runs.filter((r) => r.argv[0] !== '/usr/bin/git').map((r) => r.argv[2])).toEqual(['--probe'])
+    expect(h.runs.filter((r) => r.argv[0] !== '/usr/bin/git' && r.argv[0] !== '/usr/bin/uname').map((r) => r.argv[2])).toEqual(['--probe'])
     expect(result.additionalContext ?? []).toEqual([])
   })
 
@@ -368,7 +368,7 @@ describe('session start', () => {
   test('outside a git repository nothing runs but git', async ($, on) => {
     const h = host(on)
     const result = await $.classic.SessionStart({ source: 'startup', cwd: '/tmp/x' } as never)
-    expect(h.runs.every((r) => r.argv[0] === '/usr/bin/git')).toBe(true)
+    expect(h.runs.every((r) => r.argv[0] === '/usr/bin/git' || r.argv[0] === '/usr/bin/uname')).toBe(true)
     expect(result.additionalContext ?? []).toEqual([])
   })
 
