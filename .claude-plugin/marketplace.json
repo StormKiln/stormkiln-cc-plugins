@@ -12,6 +12,14 @@
       "version": "0.2.0",
       "category": "productivity",
       "keywords": ["context", "cost", "cache", "subagents", "tokens"]
+    },
+    {
+      "name": "codegraph-worktree",
+      "source": "./plugins/codegraph-worktree",
+      "description": "Makes CodeGraph work in git worktrees: copies the index into a new worktree (copy-on-write where the file system can), indexes repositories that have none, and recommends installing CodeGraph when it is missing.",
+      "version": "0.1.0",
+      "category": "productivity",
+      "keywords": ["codegraph", "worktree", "git", "index", "code-intelligence"]
     }
   ]
 }
